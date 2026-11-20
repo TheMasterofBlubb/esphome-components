@@ -226,6 +226,9 @@ namespace esphome
                              uint32_t timeout_ms = 1000);
       esp_err_t get_string_descriptor(uint8_t string_index, std::string& result);
       
+      // HID report descriptor (used by the descriptor-driven HID-PDC protocol)
+      esp_err_t get_report_descriptor(std::vector<uint8_t>& descriptor);
+      
       // Transport information
       bool is_connected() const;
       uint16_t get_vendor_id() const; 

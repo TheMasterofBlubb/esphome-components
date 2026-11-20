@@ -42,7 +42,9 @@
 
 // Power Components
 #define HID_USAGE_POW_BATTERY_SYSTEM            0x0010
+#define HID_USAGE_POW_BATTERY_SYSTEM_ID         0x0011
 #define HID_USAGE_POW_BATTERY                   0x0012
+#define HID_USAGE_POW_BATTERY_ID                0x0013
 #define HID_USAGE_POW_INPUT                     0x001A
 #define HID_USAGE_POW_OUTPUT                    0x001C
 #define HID_USAGE_POW_POWER_SUMMARY             0x0024
@@ -99,8 +101,14 @@
 #define HID_USAGE_BAT_DISCHARGING               0x0045
 #define HID_USAGE_BAT_FULLY_CHARGED             0x0046
 #define HID_USAGE_BAT_NEED_REPLACEMENT          0x004B
+#define HID_USAGE_BAT_AC_PRESENT                0x00D0
+#define HID_USAGE_BAT_BATTERY_PRESENT           0x00D1
+#define HID_USAGE_BAT_POWER_FAIL                0x00D2
+#define HID_USAGE_BAT_VOLTAGE_OUT_OF_RANGE      0x00D8
 
 // Battery Measurements
+#define HID_USAGE_BAT_AT_RATE_TIME_TO_EMPTY     0x0061
+#define HID_USAGE_BAT_RELATIVE_STATE_OF_CHARGE  0x0064
 #define HID_USAGE_BAT_REMAINING_CAPACITY        0x0066
 #define HID_USAGE_BAT_FULL_CHARGE_CAPACITY      0x0067
 #define HID_USAGE_BAT_RUN_TIME_TO_EMPTY         0x0068

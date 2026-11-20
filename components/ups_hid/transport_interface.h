@@ -42,6 +42,16 @@ public:
     virtual esp_err_t get_string_descriptor(uint8_t string_index, 
                                           std::string& result) = 0;
     
+    // HID report descriptor (GET_DESCRIPTOR, bDescriptorType 0x22). Optional:
+    // transports that cannot provide it return ESP_ERR_NOT_SUPPORTED so that
+    // descriptor-driven protocols can fall back to the heuristic ones.
+    virtual esp_err_t get_report_descriptor(std::vector<uint8_t>& descriptor,
+                                            uint32_t timeout_ms = 1000) {
+        (void) descriptor;
+        (void) timeout_ms;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
     // Error information
     virtual std::string get_last_error() const = 0;
 };

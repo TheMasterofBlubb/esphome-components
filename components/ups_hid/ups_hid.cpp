@@ -10,6 +10,7 @@
 #include "protocol_cyberpower.h"
  
 #include "protocol_generic.h"
+#include "protocol_eaton.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include <functional>
@@ -22,6 +23,7 @@ namespace ups_hid {
 std::unique_ptr<UpsProtocolBase> create_apc_protocol(UpsHidComponent *parent);
 std::unique_ptr<UpsProtocolBase> create_cyberpower_protocol(UpsHidComponent *parent);
 std::unique_ptr<UpsProtocolBase> create_generic_protocol(UpsHidComponent *parent);
+std::unique_ptr<UpsProtocolBase> create_eaton_protocol(UpsHidComponent *parent);
 
 // Register protocols at setup() time instead of during static initialisation
 static void register_builtin_protocols() {
@@ -44,6 +46,20 @@ static void register_builtin_protocols() {
   cp.supported_vendors = {0x0764};
   cp.priority = 100;
   ProtocolFactory::register_protocol_for_vendor(0x0764, cp);
+
+  // Descriptor-driven HID Power Device decoder. Eaton / Metrics (0x0463,
+  // 0x06DA) and other standards-compliant devices place their fields where
+  // their own report descriptor says, so decoding them needs the descriptor
+  // instead of hardcoded offsets. Preferred over the heuristic generic
+  // protocol, but it declines devices whose descriptor cannot be read, in
+  // which case the generic fallback still gets a chance.
+  ProtocolFactory::ProtocolInfo hidpd;
+  hidpd.creator = create_eaton_protocol;
+  hidpd.name = "Eaton HID PDC Protocol";
+  hidpd.description = "Report-descriptor driven HID Power Device protocol";
+  hidpd.supported_vendors = {};
+  hidpd.priority = 20;
+  ProtocolFactory::register_fallback_protocol(hidpd);
 
   ProtocolFactory::ProtocolInfo gen;
   gen.creator = create_generic_protocol;
@@ -187,6 +203,13 @@ esp_err_t UpsHidComponent::get_string_descriptor(uint8_t string_index, std::stri
   return transport_->get_string_descriptor(string_index, result);
 }
 
+esp_err_t UpsHidComponent::get_report_descriptor(std::vector<uint8_t>& descriptor) {
+  if (!transport_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  return transport_->get_report_descriptor(descriptor);
+}
+
 bool UpsHidComponent::is_connected() const {
   return transport_ && transport_->is_connected();
 }
@@ -258,9 +281,23 @@ bool UpsHidComponent::detect_protocol() {
   
   // Initialize the protocol (detection already done by factory)
   if (!active_protocol_->initialize()) {
-    ESP_LOGE(TAG, "Protocol initialization failed");
+    const std::string failed = active_protocol_->get_protocol_name();
     active_protocol_.reset();
-    return false;
+    // Running with no protocol at all is worse than an approximate decode, so
+    // retry with the heuristic protocol that needs no report descriptor.
+    if (failed.find("Generic") == std::string::npos) {
+      ESP_LOGW(TAG, "'%s' failed to initialise; trying the generic fallback protocol", failed.c_str());
+      active_protocol_ = ProtocolFactory::create_by_name("generic", this);
+      if (active_protocol_ && active_protocol_->initialize()) {
+        ESP_LOGI(TAG, "Protocol initialised (fallback): %s", active_protocol_->get_protocol_name().c_str());
+      } else {
+        active_protocol_.reset();
+      }
+    }
+    if (!active_protocol_) {
+      ESP_LOGE(TAG, "Protocol initialization failed");
+      return false;
+    }
   }
   
   ESP_LOGI(TAG, "Protocol initialized: %s", 

@@ -408,6 +408,134 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
     return ret;
 }
 
+esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descriptor,
+                                                   uint32_t timeout_ms) {
+    if (!device_.dev_hdl) {
+        set_last_error("USB device not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // HID descriptor type codes (kept local: not every ESP-IDF release exposes
+    // these as macros in usb/usb_types_ch9.h).
+    static constexpr uint8_t kDescTypeConfiguration = 0x02;
+    static constexpr uint8_t kDescTypeHid = 0x21;
+    static constexpr uint8_t kDescTypeHidReport = 0x22;
+
+    // Synchronous control IN transfer (same pattern as the string descriptor).
+    auto control_in = [&](uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
+                          uint8_t* out, size_t want, size_t* got) -> esp_err_t {
+        usb_transfer_t* transfer = nullptr;
+        const size_t transfer_size = sizeof(usb_setup_packet_t) + want;
+        esp_err_t ret = usb_host_transfer_alloc(transfer_size, 0, &transfer);
+        if (ret != ESP_OK) {
+            set_last_error("Descriptor transfer alloc failed: " + std::string(esp_err_to_name(ret)));
+            return ret;
+        }
+
+        usb_setup_packet_t* setup = (usb_setup_packet_t*)transfer->data_buffer;
+        setup->bmRequestType = bmRequestType;
+        setup->bRequest = bRequest;
+        setup->wValue = wValue;
+        setup->wIndex = wIndex;
+        setup->wLength = static_cast<uint16_t>(want);
+
+        transfer->device_handle = device_.dev_hdl;
+        transfer->bEndpointAddress = 0;
+        transfer->num_bytes = transfer_size;
+        transfer->timeout_ms = timeout_ms;
+
+        SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+        if (!done_sem) {
+            usb_host_transfer_free(transfer);
+            return ESP_ERR_NO_MEM;
+        }
+
+        struct Ctx {
+            SemaphoreHandle_t sem;
+            esp_err_t result;
+            size_t actual;
+        } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+
+        transfer->context = &ctx;
+        transfer->callback = [](usb_transfer_t* t) {
+            auto* c = static_cast<Ctx*>(t->context);
+            c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+            c->actual = t->actual_num_bytes;
+            xSemaphoreGive(c->sem);
+        };
+
+        ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
+        if (ret == ESP_OK) {
+            if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 500)) == pdTRUE) {
+                ret = ctx.result;
+                if (ret == ESP_OK && ctx.actual > sizeof(usb_setup_packet_t)) {
+                    *got = std::min(ctx.actual - sizeof(usb_setup_packet_t), want);
+                    memcpy(out, transfer->data_buffer + sizeof(usb_setup_packet_t), *got);
+                } else {
+                    *got = 0;
+                    ret = ESP_FAIL;
+                }
+            } else {
+                ESP_LOGW(ESP32_USB_TAG, "Descriptor request timeout");
+                ret = ESP_ERR_TIMEOUT;
+            }
+        } else {
+            ESP_LOGW(ESP32_USB_TAG, "Failed to submit descriptor request: %s", esp_err_to_name(ret));
+        }
+
+        vSemaphoreDelete(done_sem);
+        usb_host_transfer_free(transfer);
+        return ret;
+    };
+
+    const uint8_t std_in = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                           USB_BM_REQUEST_TYPE_RECIP_DEVICE;
+
+    // A HID report descriptor has no self-describing length, but the HID class
+    // descriptor inside the configuration descriptor carries wDescriptorLength.
+    uint16_t report_desc_len = 0;
+    std::vector<uint8_t> cfg(255, 0);
+    size_t got = 0;
+    esp_err_t ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+                               (kDescTypeConfiguration << 8) | 0, 0,
+                               cfg.data(), cfg.size(), &got);
+    if (ret == ESP_OK && got > cfg[0]) {
+        for (size_t i = cfg[0]; i + 7 < got;) {
+            const uint8_t blen = cfg[i];
+            if (blen < 2 || i + blen > got)
+                break;
+            if (cfg[i + 1] == kDescTypeHid && blen >= 8) {
+                report_desc_len = static_cast<uint16_t>(cfg[i + 6] | (cfg[i + 7] << 8));
+                break;
+            }
+            i += blen;
+        }
+    }
+    if (report_desc_len == 0) {
+        // Fall back to a generous request; devices answer with a short packet.
+        report_desc_len = 1024;
+        ESP_LOGD(ESP32_USB_TAG, "HID class descriptor not found in config descriptor, trying 1024 bytes");
+    }
+
+    std::vector<uint8_t> rd(report_desc_len, 0);
+    got = 0;
+    ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+                     (kDescTypeHidReport << 8) | 0, device_.interface_num,
+                     rd.data(), rd.size(), &got);
+    if (ret != ESP_OK || got < 8) {
+        ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR failed: %s (%zu bytes)",
+                 esp_err_to_name(ret), got);
+        set_last_error("HID report descriptor read failed");
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+
+    rd.resize(got);
+    descriptor.swap(rd);
+    ESP_LOGI(ESP32_USB_TAG, "HID report descriptor: %zu bytes (wDescriptorLength=%u)",
+             descriptor.size(), static_cast<unsigned>(report_desc_len));
+    return ESP_OK;
+}
+
 std::string Esp32UsbTransport::get_last_error() const {
     std::lock_guard<std::mutex> lock(error_mutex_);
     return last_error_;
