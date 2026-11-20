@@ -98,14 +98,14 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   std::vector<uint8_t> rd;
   const esp_err_t err = parent_->get_report_descriptor(rd);
   if (err != ESP_OK || rd.size() < 8) {
-    ESP_LOGD(EATON_TAG, "No HID report descriptor available (%s) - this device needs another protocol",
+    ESP_LOGW(EATON_TAG, "No HID report descriptor available (%s) - this device needs another protocol",
              esp_err_to_name(err));
     return false;
   }
 
   descriptor_bytes_ = rd.size();
   if (!parse_descriptor(rd)) {
-    ESP_LOGD(EATON_TAG, "HID-PDC field map unusable (descriptor %u bytes, %zu fields)",
+    ESP_LOGW(EATON_TAG, "HID-PDC field map unusable (descriptor %u bytes, %zu fields)",
              static_cast<unsigned>(descriptor_bytes_), fields_.size());
     fields_.clear();
     return false;
@@ -117,8 +117,9 @@ bool EatonHidpdProtocol::fetch_and_parse() {
     if (f.usage == 0)
       continue;  // padding/constant
     ESP_LOGD(EATON_TAG, "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
-             f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, f.log_min, f.log_max,
-             static_cast<unsigned>(f.unit), f.unit_exp, path_to_string(f.path).c_str());
+             f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
+             static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
+             path_to_string(f.path).c_str());
   }
   return true;
 }
@@ -191,7 +192,8 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
         // firmware emits a wide page item whose value also carries the usage in
         // the low byte (0x8404); normalise so the usage-page comparisons hold.
         if (val > 0xFF) {
-          ESP_LOGD(EATON_TAG, "usage page 0x%04X normalised to 0x%02X", val, val >> 8);
+          ESP_LOGD(EATON_TAG, "usage page 0x%04X normalised to 0x%02X", static_cast<unsigned>(val),
+                   static_cast<unsigned>(val >> 8));
           page = static_cast<uint16_t>(val >> 8);
         } else {
           page = static_cast<uint16_t>(val);

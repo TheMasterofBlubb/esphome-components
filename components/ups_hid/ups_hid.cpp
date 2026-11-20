@@ -263,11 +263,11 @@ bool UpsHidComponent::detect_protocol() {
   
   if (protocol_selection_ == "auto") {
     // Automatic protocol detection based on vendor ID
-    ESP_LOGD(TAG, "Auto-detecting protocol for vendor 0x%04X using factory", vendor_id);
+    ESP_LOGI(TAG, "Auto-detecting protocol for vendor 0x%04X using factory", vendor_id);
     active_protocol_ = ProtocolFactory::create_for_vendor(vendor_id, this);
   } else {
     // Manual protocol selection via factory
-    ESP_LOGD(TAG, "Using manually selected protocol: %s", protocol_selection_.c_str());
+    ESP_LOGI(TAG, "Using manually selected protocol: %s", protocol_selection_.c_str());
     active_protocol_ = ProtocolFactory::create_by_name(protocol_selection_, this);
   }
   
