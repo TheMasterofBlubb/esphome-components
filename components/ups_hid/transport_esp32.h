@@ -87,6 +87,10 @@ private:
     // Diagnostic one-liner built during get_report_descriptor(): interfaces,
     // HID class descriptor lengths, kept report-descriptor index.
     std::string usb_topology_summary_;
+
+    // Cooldown (esp_timer us) after a full-size report-descriptor read timed
+    // out: fetch small windows until then to protect the loop task.
+    int64_t small_window_until_us_{0};
     
     // Private methods
     static void usb_lib_task(void* arg);

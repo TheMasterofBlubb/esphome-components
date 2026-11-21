@@ -3,6 +3,7 @@
 #include "constants_hid.h"
 #include "constants_ups.h"
 #include "esphome/core/log.h"
+#include "esphome/core/util.h"  // millis()
 
 #include <algorithm>
 #include <cmath>
@@ -724,6 +725,7 @@ void EatonHidpdProtocol::publish(const Decoded &d, UpsData &data) const {
 // -------------------------------------------------------------------- reads
 
 bool EatonHidpdProtocol::read_data(UpsData &data) {
+  const uint32_t cycle_start = millis();
   if (fields_.empty() && !fetch_and_parse())
     return false;
   poll_cycles_++;
@@ -731,12 +733,22 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
   Decoded d;
   bool decoded_any = false;
 
+  // Time budget: the loop task blocks through this whole function and the
+  // ESP-IDF task watchdog fires after ~5 s. Hard-stop USB work well below
+  // that; whatever is left unread is picked up next cycle (cached reports
+  // persist).
+  constexpr uint32_t CYCLE_USB_BUDGET_MS = 2000;
+  auto budget_left = [cycle_start]() -> uint32_t {
+    const uint32_t used = millis() - cycle_start;
+    return used >= CYCLE_USB_BUDGET_MS ? 0 : CYCLE_USB_BUDGET_MS - used;
+  };
+
   // NUT reads the interrupt-IN endpoint: devices like the Eaton 5PX stream
   // their reports there spontaneously and may STALL or ignore GET_REPORT for
   // some report IDs. Drain a few interrupt reports into the per-report cache.
   if (!interrupt_unsupported_) {
     uint8_t ibuf[MAX_REPORT_BYTES];
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2 && budget_left() > 500; i++) {
       size_t ilen = sizeof(ibuf);
       const esp_err_t ir = parent_->read_interrupt(ibuf, &ilen, 100);
       if (ir == ESP_ERR_NOT_SUPPORTED || ir == ESP_ERR_INVALID_STATE) {
@@ -769,9 +781,19 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
   for (uint8_t report_id : input_reports_) {
     if (dead_reports_.find(report_id) != dead_reports_.end())
       continue;
+    const uint32_t left = budget_left();
+    if (left < 400) {
+      if (poll_cycles_ <= 8)
+        ESP_LOGW(EATON_TAG, "report sweep stopped at cycle budget (%u ms); rest deferred",
+                 static_cast<unsigned>(CYCLE_USB_BUDGET_MS));
+      else
+        ESP_LOGD(EATON_TAG, "report sweep stopped at cycle budget; rest deferred");
+      break;
+    }
     uint8_t buf[MAX_REPORT_BYTES];
     size_t len = sizeof(buf);
-    const esp_err_t err = parent_->hid_get_report(HID_REPORT_TYPE_INPUT, report_id, buf, &len, 1500);
+    const esp_err_t err =
+        parent_->hid_get_report(HID_REPORT_TYPE_INPUT, report_id, buf, &len, std::min<uint32_t>(700, left));
     if (err != ESP_OK || len == 0) {
       if (++report_strikes_[report_id] >= 2) {
         dead_reports_.insert(report_id);

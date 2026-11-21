@@ -4,7 +4,8 @@
 #include "esphome/core/helpers.h"
 
 #include <cstdio>  // snprintf
-#include <new>  // std::nothrow
+#include <new>     // std::nothrow
+#include "esp_timer.h"  // esp_timer_get_time (descriptor cooldown)
 
 #ifdef USE_ESP32
 
@@ -171,9 +172,10 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        // Wait longer than the transfer's own timeout so the callback
-        // normally lands before we release anything.
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+        // Wait slightly longer than the transfer's own timeout so the callback
+        // normally lands before we release anything (kept small: the loop
+        // task blocks here and the task watchdog fires at ~5 s).
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 800)) == pdTRUE) {
             ret = ctx->result;
             if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
                 size_t data_received = ctx->actual_bytes - sizeof(usb_setup_packet_t);
@@ -280,7 +282,7 @@ esp_err_t Esp32UsbTransport::hid_set_report(uint8_t report_type, uint8_t report_
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 800)) == pdTRUE) {
             ret = ctx->result;
             if (ret == ESP_OK) {
                 ESP_LOGD(ESP32_USB_TAG, "HID SET_REPORT success");
@@ -377,7 +379,7 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timing::USB_SEMAPHORE_TIMEOUT_MS + 2000)) == pdTRUE) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timing::USB_SEMAPHORE_TIMEOUT_MS + 800)) == pdTRUE) {
             ret = ctx->result;
             if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
                 // Parse the USB string descriptor
@@ -519,7 +521,7 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
             // The transfer's own timeout_ms should always make the driver
             // invoke the callback; the extra 2 s is slack so we normally free
             // everything while nothing is still in flight.
-            if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+            if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(to + 800)) == pdTRUE) {
                 ret = ctx->result;
                 if (ret == ESP_OK && ctx->actual > sizeof(usb_setup_packet_t)) {
                     *got = std::min(ctx->actual - sizeof(usb_setup_packet_t), want);
@@ -619,9 +621,15 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
       want = 1024;
     if (want > 32768)
       want = 32768;
-    // Full-speed EP0 streams ~8 bytes/ms at worst; scale the transfer timeout
-    // with the requested size (23 KB -> ~7 s).
-    const uint32_t desc_to = timeout_ms + want / 4;
+    // Transfer timeout scaled with size but kept WELL under the 5 s task
+    // watchdog: the loop task blocks here. 23 KB streams in ~0.5 s on a
+    // healthy EP0; a device that NAK-throttles gets ~2.5 s, after which we
+    // give up (leak-safe) and retry later with the smaller window.
+    // A recent full-size timeout arms a cooldown: fetch at 2048 for a while
+    // instead of stalling the loop with slow full-size attempts every cycle.
+    if (report_desc_len > 2048 && esp_timer_get_time() < small_window_until_us_)
+      want = 2048;
+    const uint32_t desc_to = timeout_ms + std::min<uint32_t>(1500, want / 16);
     std::vector<uint8_t> best;
     uint8_t best_idx = 0;
     for (uint8_t idx = 0; idx <= 1; idx++) {
@@ -630,7 +638,10 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
                                  (kDescTypeHidReport << 8) | idx, device_.interface_num,
                                  rd.data(), want, &g, desc_to);
-        if (r != ESP_OK || g < 8) {
+        // Only a device that REJECTED (STALL) the request is worth retrying
+        // with the other recipient; a device that TIMED OUT won't answer
+        // faster on the second attempt, and stacking waits risks the WDT.
+        if ((r != ESP_OK || g < 8) && r != ESP_ERR_TIMEOUT) {
             g = 0;
             r = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
                            (kDescTypeHidReport << 8) | idx, device_.interface_num,
@@ -643,7 +654,14 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
                 best_idx = idx;
             }
         } else if (idx == 0) {
-            ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR index 0 failed: %s", esp_err_to_name(r));
+            if (r == ESP_ERR_TIMEOUT && want > 2048) {
+                small_window_until_us_ = esp_timer_get_time() + 60 * 1000000LL;
+                ESP_LOGW(ESP32_USB_TAG,
+                         "Full %u-byte report descriptor read timed out; using 2048-byte window for 60 s",
+                         static_cast<unsigned>(want));
+            } else {
+                ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR index 0 failed: %s", esp_err_to_name(r));
+            }
         }
     }
 
@@ -669,7 +687,7 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
             size_t g = 0;
             const esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
                                            (kDescTypeHidReport << 8) | idx, iface, rd.data(), want, &g,
-                                           timeout_ms + 1500);
+                                           timeout_ms);
             if (r == ESP_OK && g >= 8) {
               rd.resize(g);
               if (rd.size() > best.size()) {
@@ -790,7 +808,7 @@ esp_err_t Esp32UsbTransport::read_interrupt(uint8_t* data, size_t* len, uint32_t
 
     ret = usb_host_transfer_submit(transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 1000)) == pdTRUE) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 300)) == pdTRUE) {
             ret = ctx->result;
             size_t n = std::min(ctx->actual, *len);
             if (n > 0) {
