@@ -131,7 +131,7 @@ void UpsHidComponent::update() {
     // Re-log a bounded slice per cycle: the full field-map stash (and the
     // protocol's first-cycle dump) in one burst overflows the logger task
     // buffer, and then NOTHING from the cycle survives.
-    const size_t n = pending_protocol_logs_.size() < 20 ? pending_protocol_logs_.size() : 20;
+    const size_t n = pending_protocol_logs_.size() < 10 ? pending_protocol_logs_.size() : 10;
     for (size_t i = 0; i < n; i++) {
       if (i == 0)
         ESP_LOGI(TAG, "%s", pending_protocol_logs_[i].c_str());

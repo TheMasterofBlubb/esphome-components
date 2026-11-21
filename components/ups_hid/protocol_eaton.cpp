@@ -108,6 +108,7 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   descriptor_bytes_ = rd.size();
   map_dump_pos_ = 0;
   map_header_logged_ = false;
+  decoded_shown_ = 0;
   if (!parse_descriptor(rd)) {
     last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
                   " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
@@ -128,11 +129,10 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   pending_logs_.emplace_back(line);
   ESP_LOGI(EATON_TAG, "HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
            fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
-  // Stash only a bounded prefix of the map for the deferred re-logging: the
-  // full 5PX descriptor has hundreds of fields and queueing them all at boot
-  // wastes internal RAM (each entry is a heap string). read_data()'s
-  // first-cycle dump logs the complete map in a context that survives the
-  // boot flood anyway.
+  // Stash only a small prefix of the map for the deferred re-logging (the
+  // read_data() first-cycle dump streams the complete map in a context that
+  // survives the boot flood anyway): the full 5PX descriptor has hundreds of
+  // fields and queueing them all wastes internal RAM and poll cycles.
   size_t queued = 0;
   for (const auto &f : fields_) {
     if (f.usage == 0)
@@ -141,12 +141,12 @@ bool EatonHidpdProtocol::fetch_and_parse() {
              f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
              static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
              path_to_string(f.path).c_str());
-    if (queued++ < 60)
+    if (queued++ < 10)
       pending_logs_.emplace_back(line);
     ESP_LOGD(EATON_TAG, "%s", line);
   }
-  if (queued > 60) {
-    snprintf(line, sizeof(line), "  ... %zu more fields (full map dumped on first poll cycle)", queued - 60);
+  if (queued > 10) {
+    snprintf(line, sizeof(line), "  ... %zu more fields (full map streamed during the first poll cycles)", queued - 10);
     pending_logs_.emplace_back(line);
   }
   return true;
@@ -768,14 +768,6 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
       map_header_logged_ = true;
       ESP_LOGD(EATON_TAG, "FIELD MAP (%zu fields / %zu input reports, descriptor %u bytes):", fields_.size(),
                input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
-      ESP_LOGD(EATON_TAG,
-               "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "
-               "online=%d onbat=%d chg=%d full=%d ovld=%d fail=%d volimit=%d",
-               d.voltage_input, d.voltage_output, d.voltage_battery, d.voltage_nom_battery, d.battery_level,
-               d.load_percent, d.frequency, d.runtime_seconds, static_cast<int>(d.online),
-               static_cast<int>(d.on_battery), static_cast<int>(d.charging), static_cast<int>(d.fully_charged),
-               static_cast<int>(d.overload), static_cast<int>(d.internal_failure),
-               static_cast<int>(d.voltage_out_of_range));
     }
     size_t emitted = 0;
     for (; map_dump_pos_ < fields_.size(); map_dump_pos_++) {
@@ -786,13 +778,27 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
                f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
                static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
                path_to_string(f.path).c_str());
-      if (++emitted >= 20) {
+      if (++emitted >= 8) {
         map_dump_pos_++;  // for-clause increment is skipped by break
         break;
       }
     }
     if (map_dump_pos_ >= fields_.size())
       first_cycle_ = false;
+  }
+
+  // Repeat the value summary for its first cycles: if one cycle's log burst
+  // gets dropped by the logger buffer, the summary still reaches the log.
+  if (decoded_shown_ < 3) {
+    decoded_shown_++;
+    ESP_LOGD(EATON_TAG,
+             "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "
+             "online=%d onbat=%d chg=%d full=%d ovld=%d fail=%d volimit=%d",
+             d.voltage_input, d.voltage_output, d.voltage_battery, d.voltage_nom_battery, d.battery_level,
+             d.load_percent, d.frequency, d.runtime_seconds, static_cast<int>(d.online),
+             static_cast<int>(d.on_battery), static_cast<int>(d.charging), static_cast<int>(d.fully_charged),
+             static_cast<int>(d.overload), static_cast<int>(d.internal_failure),
+             static_cast<int>(d.voltage_out_of_range));
   }
 
   if (!decoded_any)
