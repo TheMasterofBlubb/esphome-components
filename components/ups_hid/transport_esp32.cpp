@@ -3,6 +3,8 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 
+#include <new>  // std::nothrow
+
 #ifdef USE_ESP32
 
 namespace esphome {
@@ -143,16 +145,24 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
         return ESP_ERR_NO_MEM;
     }
     
-    // Simple context for completion
-    struct {
+    // Simple context for completion. Heap-allocated: a late callback must
+    // never write to an already-returned stack frame (see get_report_descriptor
+    // for the full rationale).
+    struct Ctx {
         SemaphoreHandle_t sem;
         esp_err_t result;
         size_t actual_bytes;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+    };
+    Ctx* ctx = new (std::nothrow) Ctx{done_sem, ESP_ERR_TIMEOUT, 0};
+    if (!ctx) {
+        vSemaphoreDelete(done_sem);
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<Ctx*>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
         xSemaphoreGive(c->sem);
@@ -160,10 +170,12 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            ret = ctx.result;
-            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
-                size_t data_received = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+        // Wait longer than the transfer's own timeout so the callback
+        // normally lands before we release anything.
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+            ret = ctx->result;
+            if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
+                size_t data_received = ctx->actual_bytes - sizeof(usb_setup_packet_t);
                 size_t copy_len = std::min(data_received, *data_len);
                 memcpy(data, transfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
                 *data_len = copy_len;
@@ -175,13 +187,16 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
                 ret = ESP_FAIL;
             }
         } else {
-            ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT timeout");
-            ret = ESP_ERR_TIMEOUT;
+            // The transfer may still be in flight: leak it rather than free
+            // memory a late callback would write to.
+            ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT timeout; leaking one transfer to stay safe");
+            return ESP_ERR_TIMEOUT;
         }
     } else {
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit HID GET_REPORT: %s", esp_err_to_name(ret));
     }
-    
+
+    delete ctx;
     vSemaphoreDelete(done_sem);
     usb_host_transfer_free(transfer);
     return ret;
@@ -243,36 +258,43 @@ esp_err_t Esp32UsbTransport::hid_set_report(uint8_t report_type, uint8_t report_
         return ESP_ERR_NO_MEM;
     }
     
-    // Simple context for completion
-    struct {
+    // Simple context for completion (heap-allocated; see hid_get_report).
+    struct Ctx {
         SemaphoreHandle_t sem;
         esp_err_t result;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT};
+    };
+    Ctx* ctx = new (std::nothrow) Ctx{done_sem, ESP_ERR_TIMEOUT};
+    if (!ctx) {
+        vSemaphoreDelete(done_sem);
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<Ctx*>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         xSemaphoreGive(c->sem);
     };
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            ret = ctx.result;
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+            ret = ctx->result;
             if (ret == ESP_OK) {
                 ESP_LOGD(ESP32_USB_TAG, "HID SET_REPORT success");
             } else {
                 ESP_LOGW(ESP32_USB_TAG, "HID SET_REPORT failed");
             }
         } else {
-            ESP_LOGW(ESP32_USB_TAG, "HID SET_REPORT timeout");
-            ret = ESP_ERR_TIMEOUT;
+            ESP_LOGW(ESP32_USB_TAG, "HID SET_REPORT timeout; leaking one transfer to stay safe");
+            return ESP_ERR_TIMEOUT;
         }
     } else {
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit HID SET_REPORT: %s", esp_err_to_name(ret));
     }
-    
+
+    delete ctx;
     vSemaphoreDelete(done_sem);
     usb_host_transfer_free(transfer);
     return ret;
@@ -331,16 +353,22 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
         return ESP_ERR_NO_MEM;
     }
     
-    // Context for completion
-    struct {
+    // Context for completion (heap-allocated; see hid_get_report).
+    struct Ctx {
         SemaphoreHandle_t sem;
         esp_err_t result;
         size_t actual_bytes;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+    };
+    Ctx* ctx = new (std::nothrow) Ctx{done_sem, ESP_ERR_TIMEOUT, 0};
+    if (!ctx) {
+        vSemaphoreDelete(done_sem);
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<Ctx*>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
         xSemaphoreGive(c->sem);
@@ -348,12 +376,12 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
     if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timing::USB_SEMAPHORE_TIMEOUT_MS)) == pdTRUE) {
-            ret = ctx.result;
-            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timing::USB_SEMAPHORE_TIMEOUT_MS + 2000)) == pdTRUE) {
+            ret = ctx->result;
+            if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
                 // Parse the USB string descriptor
                 uint8_t *desc_data = transfer->data_buffer + sizeof(usb_setup_packet_t);
-                size_t desc_len = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+                size_t desc_len = ctx->actual_bytes - sizeof(usb_setup_packet_t);
                 
                 if (desc_len >= 2) {
                     uint8_t bLength = desc_data[0];        // Total length of descriptor
@@ -396,13 +424,14 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
                 ret = ESP_FAIL;
             }
         } else {
-            ESP_LOGW(ESP32_USB_TAG, "USB string descriptor request timeout");
-            ret = ESP_ERR_TIMEOUT;
+            ESP_LOGW(ESP32_USB_TAG, "USB string descriptor request timeout; leaking one transfer to stay safe");
+            return ESP_ERR_TIMEOUT;
         }
     } else {
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit string descriptor request: %s", esp_err_to_name(ret));
     }
-    
+
+    delete ctx;
     vSemaphoreDelete(done_sem);
     usb_host_transfer_free(transfer);
     return ret;
@@ -454,9 +483,19 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
             SemaphoreHandle_t sem;
             esp_err_t result;
             size_t actual;
-        } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+        };
+        // Heap-allocate the context: if the callback fires after we gave up
+        // waiting (device held the request open), a late write must not touch
+        // an already-returned stack frame. The block is intentionally leaked
+        // on the give-up path.
+        Ctx* ctx = new (std::nothrow) Ctx{done_sem, ESP_ERR_TIMEOUT, 0};
+        if (!ctx) {
+            vSemaphoreDelete(done_sem);
+            usb_host_transfer_free(transfer);
+            return ESP_ERR_NO_MEM;
+        }
 
-        transfer->context = &ctx;
+        transfer->context = ctx;
         transfer->callback = [](usb_transfer_t* t) {
             auto* c = static_cast<Ctx*>(t->context);
             c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
@@ -466,23 +505,36 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
 
         ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
         if (ret == ESP_OK) {
-            if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 500)) == pdTRUE) {
-                ret = ctx.result;
-                if (ret == ESP_OK && ctx.actual > sizeof(usb_setup_packet_t)) {
-                    *got = std::min(ctx.actual - sizeof(usb_setup_packet_t), want);
+            // The transfer's own timeout_ms should always make the driver
+            // invoke the callback; the extra 2 s is slack so we normally free
+            // everything while nothing is still in flight.
+            if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 2000)) == pdTRUE) {
+                ret = ctx->result;
+                if (ret == ESP_OK && ctx->actual > sizeof(usb_setup_packet_t)) {
+                    *got = std::min(ctx->actual - sizeof(usb_setup_packet_t), want);
                     memcpy(out, transfer->data_buffer + sizeof(usb_setup_packet_t), *got);
                 } else {
                     *got = 0;
                     ret = ESP_FAIL;
                 }
             } else {
-                ESP_LOGW(ESP32_USB_TAG, "Descriptor request timeout");
-                ret = ESP_ERR_TIMEOUT;
+                // The driver never invoked the callback, so the transfer may
+                // still be in flight. Freeing the transfer or the semaphore
+                // now would make a late callback write to freed memory and
+                // give a deleted semaphore (memory corruption -> abort).
+                // Leak the transfer, its heap context and the semaphore
+                // instead; this path is rare and bounded by the small number
+                // of descriptor requests per boot.
+                ESP_LOGE(ESP32_USB_TAG, "Descriptor request timeout; leaking one USB transfer to stay safe");
+                return ESP_ERR_TIMEOUT;
             }
         } else {
             ESP_LOGW(ESP32_USB_TAG, "Failed to submit descriptor request: %s", esp_err_to_name(ret));
         }
 
+        // The callback has completed (semaphore was taken, or submit never
+        // started it): safe to release everything.
+        delete ctx;
         vSemaphoreDelete(done_sem);
         usb_host_transfer_free(transfer);
         return ret;
@@ -500,13 +552,18 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
                                (kDescTypeConfiguration << 8) | 0, 0,
                                cfg.data(), cfg.size(), &got);
     if (ret == ESP_OK && got > cfg[0]) {
+        // A composite device like the Eaton 5PX Gen2 lists SEVERAL HID class
+        // descriptors in its configuration descriptor (one per report
+        // descriptor index, each with its own wDescriptorLength). Take the
+        // largest declared length so the index-1 request is sized correctly.
         for (size_t i = cfg[0]; i + 7 < got;) {
             const uint8_t blen = cfg[i];
             if (blen < 2 || i + blen > got)
                 break;
             if (cfg[i + 1] == kDescTypeHid && blen >= 8) {
-                report_desc_len = static_cast<uint16_t>(cfg[i + 6] | (cfg[i + 7] << 8));
-                break;
+                const uint16_t declared = static_cast<uint16_t>(cfg[i + 6] | (cfg[i + 7] << 8));
+                if (declared > report_desc_len)
+                    report_desc_len = declared;
             }
             i += blen;
         }
