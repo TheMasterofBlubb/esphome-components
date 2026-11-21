@@ -106,6 +106,8 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   }
 
   descriptor_bytes_ = rd.size();
+  map_dump_pos_ = 0;
+  map_header_logged_ = false;
   if (!parse_descriptor(rd)) {
     last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
                   " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
@@ -757,28 +759,40 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
     }
   }
 
-  // First cycle: print the full picture here (this context demonstrably
-  // survives logging, unlike the boot detection window).
+  // First cycles: print the full picture here (this context demonstrably
+  // survives logging, unlike the boot detection window). The dump is spread
+  // across poll cycles a few lines at a time: hundreds of lines in one burst
+  // overflow the logger task buffer and everything gets dropped.
   if (first_cycle_) {
-    first_cycle_ = false;
-    ESP_LOGD(EATON_TAG, "FIELD MAP (%zu fields / %zu input reports, descriptor %u bytes):", fields_.size(),
-             input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
-    for (const auto &f : fields_) {
+    if (!map_header_logged_) {
+      map_header_logged_ = true;
+      ESP_LOGD(EATON_TAG, "FIELD MAP (%zu fields / %zu input reports, descriptor %u bytes):", fields_.size(),
+               input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+      ESP_LOGD(EATON_TAG,
+               "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "
+               "online=%d onbat=%d chg=%d full=%d ovld=%d fail=%d volimit=%d",
+               d.voltage_input, d.voltage_output, d.voltage_battery, d.voltage_nom_battery, d.battery_level,
+               d.load_percent, d.frequency, d.runtime_seconds, static_cast<int>(d.online),
+               static_cast<int>(d.on_battery), static_cast<int>(d.charging), static_cast<int>(d.fully_charged),
+               static_cast<int>(d.overload), static_cast<int>(d.internal_failure),
+               static_cast<int>(d.voltage_out_of_range));
+    }
+    size_t emitted = 0;
+    for (; map_dump_pos_ < fields_.size(); map_dump_pos_++) {
+      const Field &f = fields_[map_dump_pos_];
       if (f.usage == 0)
         continue;
       ESP_LOGD(EATON_TAG, "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
                f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
                static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
                path_to_string(f.path).c_str());
+      if (++emitted >= 20) {
+        map_dump_pos_++;  // for-clause increment is skipped by break
+        break;
+      }
     }
-    ESP_LOGD(EATON_TAG,
-             "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "
-             "online=%d onbat=%d chg=%d full=%d ovld=%d fail=%d volimit=%d",
-             d.voltage_input, d.voltage_output, d.voltage_battery, d.voltage_nom_battery, d.battery_level,
-             d.load_percent, d.frequency, d.runtime_seconds, static_cast<int>(d.online),
-             static_cast<int>(d.on_battery), static_cast<int>(d.charging), static_cast<int>(d.fully_charged),
-             static_cast<int>(d.overload), static_cast<int>(d.internal_failure),
-             static_cast<int>(d.voltage_out_of_range));
+    if (map_dump_pos_ >= fields_.size())
+      first_cycle_ = false;
   }
 
   if (!decoded_any)

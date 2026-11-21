@@ -115,10 +115,14 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   // Diagnostics for the component's deferred logging (see UpsProtocolBase).
   std::string last_error_;
   std::vector<std::string> pending_logs_;  // [0] = summary, rest = field map
-  // read_data() runs in the normal poll window (unlike detection, which sits
-  // inside the boot config-dump flood), so the first cycle also dumps the
-  // field map, raw report bytes and decoded values at DEBUG. One-shot.
+  // Cached diagnostics: read_data() runs in the normal poll window (unlike
+  // detection, which sits inside the boot config-dump flood), so the first
+  // cycles dump the field map, raw report bytes and decoded values at DEBUG.
+  // Spread across cycles (20 map lines per poll) so the logger task buffer
+  // cannot overflow and drop the whole burst.
   bool first_cycle_{true};
+  bool map_header_logged_{false};
+  size_t map_dump_pos_{0};
 };
 
 }  // namespace ups_hid

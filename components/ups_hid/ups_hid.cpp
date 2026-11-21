@@ -128,10 +128,17 @@ void UpsHidComponent::update() {
     detection_notice_.clear();
   }
   if (!pending_protocol_logs_.empty()) {
-    ESP_LOGI(TAG, "%s", pending_protocol_logs_.front().c_str());
-    for (size_t i = 1; i < pending_protocol_logs_.size(); i++)
-      ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
-    pending_protocol_logs_.clear();
+    // Re-log a bounded slice per cycle: the full field-map stash (and the
+    // protocol's first-cycle dump) in one burst overflows the logger task
+    // buffer, and then NOTHING from the cycle survives.
+    const size_t n = pending_protocol_logs_.size() < 20 ? pending_protocol_logs_.size() : 20;
+    for (size_t i = 0; i < n; i++) {
+      if (i == 0)
+        ESP_LOGI(TAG, "%s", pending_protocol_logs_[i].c_str());
+      else
+        ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
+    }
+    pending_protocol_logs_.erase(pending_protocol_logs_.begin(), pending_protocol_logs_.begin() + n);
   }
 
   // Normal data reading with active protocol
