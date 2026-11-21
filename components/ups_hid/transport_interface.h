@@ -57,6 +57,15 @@ public:
     // the transport has none.
     virtual std::string get_usb_topology_summary() const { return std::string(); }
 
+    // Non-blocking-ish interrupt-IN poll. Transports without an interrupt
+    // endpoint (or without support for this call) return NOT_SUPPORTED.
+    virtual esp_err_t read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) {
+        (void) data;
+        (void) len;
+        (void) timeout_ms;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     // Error information
     virtual std::string get_last_error() const = 0;
 };

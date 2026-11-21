@@ -14,7 +14,7 @@ namespace ups_hid {
 static const char *const EATON_TAG = "ups_hid.eaton";
 
 // HID-PDC reports on these devices fit in a single full-speed control transfer.
-static constexpr size_t MAX_REPORT_BYTES = 64;
+static constexpr size_t MAX_REPORT_BYTES = 128;
 
 // Battery collection usages all live on the Power Device page (0x10..0x13), but
 // a field on the Battery System page (0x85) is in a battery context by itself.
@@ -110,6 +110,9 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   map_header_logged_ = false;
   decoded_shown_ = 0;
   poll_cycles_ = 0;
+  map_lines_logged_ = 0;
+  report_strikes_.clear();
+  dead_reports_.clear();
   if (!parse_descriptor(rd)) {
     last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
                   " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
@@ -728,12 +731,55 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
   Decoded d;
   bool decoded_any = false;
 
+  // NUT reads the interrupt-IN endpoint: devices like the Eaton 5PX stream
+  // their reports there spontaneously and may STALL or ignore GET_REPORT for
+  // some report IDs. Drain a few interrupt reports into the per-report cache.
+  if (!interrupt_unsupported_) {
+    uint8_t ibuf[MAX_REPORT_BYTES];
+    for (int i = 0; i < 4; i++) {
+      size_t ilen = sizeof(ibuf);
+      const esp_err_t ir = parent_->read_interrupt(ibuf, &ilen, 100);
+      if (ir == ESP_ERR_NOT_SUPPORTED || ir == ESP_ERR_INVALID_STATE) {
+        interrupt_unsupported_ = true;
+        break;
+      }
+      if (ir != ESP_OK || ilen == 0)
+        break;
+      uint8_t rid = 0;
+      const uint8_t *body = ibuf;
+      size_t blen = ilen;
+      if (!input_reports_.empty()) {  // report-ID devices prefix on the interrupt endpoint
+        rid = ibuf[0];
+        body = ibuf + 1;
+        blen = ilen - 1;
+      }
+      if (blen == 0)
+        continue;
+      if (interrupt_seen_.find(rid) == interrupt_seen_.end()) {
+        interrupt_seen_.insert(rid);
+        ESP_LOGI(EATON_TAG, "interrupt report 0x%02X: %zu bytes", rid, blen);
+      }
+      report_cache_[rid].assign(body, body + blen);
+    }
+  }
+
+  // GET_REPORT sweep. Reports the device refuses or hangs on are disabled
+  // after two strikes — a hanging GET_REPORT otherwise leaks one transfer
+  // (the crash-safe give-up path) every cycle forever.
   for (uint8_t report_id : input_reports_) {
+    if (dead_reports_.find(report_id) != dead_reports_.end())
+      continue;
     uint8_t buf[MAX_REPORT_BYTES];
     size_t len = sizeof(buf);
     const esp_err_t err = parent_->hid_get_report(HID_REPORT_TYPE_INPUT, report_id, buf, &len, 1500);
     if (err != ESP_OK || len == 0) {
-      ESP_LOGD(EATON_TAG, "GET_REPORT input 0x%02X failed: %s", report_id, esp_err_to_name(err));
+      if (++report_strikes_[report_id] >= 2) {
+        dead_reports_.insert(report_id);
+        ESP_LOGW(EATON_TAG, "GET_REPORT input 0x%02X failed twice; using interrupt-endpoint data only for it",
+                 report_id);
+      } else {
+        ESP_LOGD(EATON_TAG, "GET_REPORT input 0x%02X failed: %s", report_id, esp_err_to_name(err));
+      }
       continue;
     }
     if (poll_cycles_ >= 2 && poll_cycles_ <= 4)
@@ -747,9 +793,21 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
       body++;
       body_len--;  // control-transfer GET_REPORT echoes the report ID
     }
+    report_cache_[report_id].assign(body, body + body_len);
+  }
+
+  // Decode from the cache: every report ID uses its freshest bytes, no
+  // matter which source (interrupt or GET_REPORT) delivered them.
+  for (uint8_t report_id : input_reports_) {
+    auto it = report_cache_.find(report_id);
+    if (it == report_cache_.end())
+      continue;
+    const std::vector<uint8_t> &cbuf = it->second;
+    const uint8_t *body = cbuf.data();
+    const size_t body_len = cbuf.size();
 
     const uint32_t described_bits = input_bits_[report_id];
-    if (described_bits > body_len * 8) {
+    if (described_bits > body_len * 8 && poll_cycles_ <= 6) {
       ESP_LOGW(EATON_TAG, "input report 0x%02X is %zu bytes but the descriptor describes %u bits", report_id,
                body_len, static_cast<unsigned>(described_bits));
     }
@@ -790,6 +848,12 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
                f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
                static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
                path_to_string(f.path).c_str());
+      if (++map_lines_logged_ >= 140) {
+        ESP_LOGI(EATON_TAG, "FIELD MAP log capped at %zu lines (%zu fields total; the rest stay in memory)",
+                 map_lines_logged_, fields_.size());
+        map_dump_pos_ = fields_.size();
+        break;
+      }
       if (++emitted >= 8) {
         map_dump_pos_++;  // for-clause increment is skipped by break
         break;

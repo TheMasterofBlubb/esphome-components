@@ -240,6 +240,13 @@ std::string UpsHidComponent::usb_topology_summary() const {
   return transport_ ? transport_->get_usb_topology_summary() : std::string();
 }
 
+esp_err_t UpsHidComponent::read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) {
+  if (!transport_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  return transport_->read_interrupt(data, len, timeout_ms);
+}
+
 bool UpsHidComponent::is_connected() const {
   return transport_ && transport_->is_connected();
 }

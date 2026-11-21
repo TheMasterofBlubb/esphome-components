@@ -453,10 +453,20 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
 
     // Synchronous control IN transfer (same pattern as the string descriptor).
     auto control_in = [&](uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
-                          uint8_t* out, size_t want, size_t* got) -> esp_err_t {
+                          uint8_t* out, size_t want, size_t* got, uint32_t to) -> esp_err_t {
         usb_transfer_t* transfer = nullptr;
-        const size_t transfer_size = sizeof(usb_setup_packet_t) + want;
+        size_t xfer_want = want;
+        size_t transfer_size = sizeof(usb_setup_packet_t) + xfer_want;
         esp_err_t ret = usb_host_transfer_alloc(transfer_size, 0, &transfer);
+        if (ret != ESP_OK && xfer_want > 2048) {
+            // Big DMA buffer unavailable (fragmented internal RAM): retry with
+            // the legacy 2 KB window instead of failing outright.
+            ESP_LOGW(ESP32_USB_TAG, "No %zu-byte DMA transfer available, retrying descriptor read at 2048 bytes",
+                     xfer_want);
+            xfer_want = 2048;
+            transfer_size = sizeof(usb_setup_packet_t) + xfer_want;
+            ret = usb_host_transfer_alloc(transfer_size, 0, &transfer);
+        }
         if (ret != ESP_OK) {
             set_last_error("Descriptor transfer alloc failed: " + std::string(esp_err_to_name(ret)));
             return ret;
@@ -467,12 +477,12 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         setup->bRequest = bRequest;
         setup->wValue = wValue;
         setup->wIndex = wIndex;
-        setup->wLength = static_cast<uint16_t>(want);
+        setup->wLength = static_cast<uint16_t>(xfer_want);
 
         transfer->device_handle = device_.dev_hdl;
         transfer->bEndpointAddress = 0;
         transfer->num_bytes = transfer_size;
-        transfer->timeout_ms = timeout_ms;
+        transfer->timeout_ms = to;
 
         SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
         if (!done_sem) {
@@ -513,6 +523,8 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
                 ret = ctx->result;
                 if (ret == ESP_OK && ctx->actual > sizeof(usb_setup_packet_t)) {
                     *got = std::min(ctx->actual - sizeof(usb_setup_packet_t), want);
+                    if (*got > xfer_want)
+                        *got = xfer_want;
                     memcpy(out, transfer->data_buffer + sizeof(usb_setup_packet_t), *got);
                 } else {
                     *got = 0;
@@ -551,7 +563,7 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     size_t got = 0;
     esp_err_t ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
                                (kDescTypeConfiguration << 8) | 0, 0,
-                               cfg.data(), cfg.size(), &got);
+                               cfg.data(), cfg.size(), &got, timeout_ms);
     if (ret == ESP_OK && got > 3) {
       // Devices with several interfaces can have a configuration descriptor
       // longer than the first 255-byte probe; refetch the whole thing so the
@@ -561,7 +573,7 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         cfg.assign(total, 0);
         ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
                          (kDescTypeConfiguration << 8) | 0, 0,
-                         cfg.data(), cfg.size(), &got);
+                         cfg.data(), cfg.size(), &got, timeout_ms);
       }
     }
     if (ret == ESP_OK && got > cfg[0]) {
@@ -598,8 +610,18 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     // status) at index 1; NUT forces usb_hid_desc_index=1 for exactly that
     // VID/bcdDevice pair (drivers/libusb1.c). Fetch both indexes and keep the
     // larger answer — other devices simply STALL the index-1 request.
-    // wLength is deliberately generous: a device answers with a short packet.
-    const uint16_t want = std::min<uint16_t>(std::max<uint16_t>(report_desc_len, 1024), 2048);
+    // wLength covers the FULL declared length: the Eaton 5PX Gen2 declares a
+    // ~23 KB report descriptor (its full measurement MIB), and a truncated
+    // fetch yields a useless partial map. A huge 23 KB DMA alloc could fail on
+    // a loaded ESP32, so fall back to the old 2 KB window in that case.
+    uint16_t want = report_desc_len;
+    if (want < 1024)
+      want = 1024;
+    if (want > 32768)
+      want = 32768;
+    // Full-speed EP0 streams ~8 bytes/ms at worst; scale the transfer timeout
+    // with the requested size (23 KB -> ~7 s).
+    const uint32_t desc_to = timeout_ms + want / 4;
     std::vector<uint8_t> best;
     uint8_t best_idx = 0;
     for (uint8_t idx = 0; idx <= 1; idx++) {
@@ -607,12 +629,12 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         size_t g = 0;
         esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
                                  (kDescTypeHidReport << 8) | idx, device_.interface_num,
-                                 rd.data(), want, &g);
+                                 rd.data(), want, &g, desc_to);
         if (r != ESP_OK || g < 8) {
             g = 0;
             r = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
                            (kDescTypeHidReport << 8) | idx, device_.interface_num,
-                           rd.data(), want, &g);
+                           rd.data(), want, &g, desc_to);
         }
         if (r == ESP_OK && g >= 8) {
             rd.resize(g);
@@ -646,7 +668,8 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
             std::vector<uint8_t> rd(want, 0);
             size_t g = 0;
             const esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
-                                           (kDescTypeHidReport << 8) | idx, iface, rd.data(), want, &g);
+                                           (kDescTypeHidReport << 8) | idx, iface, rd.data(), want, &g,
+                                           timeout_ms + 1500);
             if (r == ESP_OK && g >= 8) {
               rd.resize(g);
               if (rd.size() > best.size()) {
@@ -722,6 +745,69 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
 std::string Esp32UsbTransport::get_last_error() const {
     std::lock_guard<std::mutex> lock(error_mutex_);
     return last_error_;
+}
+
+esp_err_t Esp32UsbTransport::read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) {
+    if (!is_connected() || device_.ep_in == 0)
+        return ESP_ERR_NOT_SUPPORTED;
+    if (!data || !len || *len == 0)
+        return ESP_ERR_INVALID_ARG;
+
+    usb_transfer_t* transfer = nullptr;
+    esp_err_t ret = usb_host_transfer_alloc(*len, 0, &transfer);
+    if (ret != ESP_OK)
+        return ret;
+
+    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+    if (!done_sem) {
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
+    // Same lifetime discipline as control_in: heap context, leak on give-up.
+    struct Ctx {
+        SemaphoreHandle_t sem;
+        esp_err_t result;
+        size_t actual;
+    };
+    Ctx* ctx = new (std::nothrow) Ctx{done_sem, ESP_ERR_TIMEOUT, 0};
+    if (!ctx) {
+        vSemaphoreDelete(done_sem);
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
+
+    transfer->num_bytes = *len;
+    transfer->device_handle = device_.dev_hdl;
+    transfer->bEndpointAddress = device_.ep_in;
+    transfer->timeout_ms = timeout_ms;
+    transfer->context = ctx;
+    transfer->callback = [](usb_transfer_t* t) {
+        auto* c = static_cast<Ctx*>(t->context);
+        c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_ERR_TIMEOUT;
+        c->actual = t->actual_num_bytes;
+        xSemaphoreGive(c->sem);
+    };
+
+    ret = usb_host_transfer_submit(transfer);
+    if (ret == ESP_OK) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms + 1000)) == pdTRUE) {
+            ret = ctx->result;
+            size_t n = std::min(ctx->actual, *len);
+            if (n > 0) {
+                memcpy(data, transfer->data_buffer, n);
+                *len = n;
+                ret = ESP_OK;  // data was delivered even if the status is odd
+            }
+        } else {
+            ESP_LOGW(ESP32_USB_TAG, "Interrupt read give-up; leaking one transfer to stay safe");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    delete ctx;
+    vSemaphoreDelete(done_sem);
+    usb_host_transfer_free(transfer);
+    return ret;
 }
 
 // Private methods implementation

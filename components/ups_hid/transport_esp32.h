@@ -52,6 +52,8 @@ public:
 
     std::string get_usb_topology_summary() const override { return usb_topology_summary_; }
 
+    esp_err_t read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) override;
+
 private:
     // USB device structure
     struct UsbDevice {

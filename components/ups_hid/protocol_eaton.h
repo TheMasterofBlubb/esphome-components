@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -125,6 +126,15 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   size_t map_dump_pos_{0};
   int decoded_shown_{0};  // print the decoded summary on the first cycles
   int poll_cycles_{0};    // poll cycles since the map was (re)fetched
+
+  // Latest bytes per report ID, fed by BOTH the interrupt endpoint (NUT
+  // style, spontaneous) and GET_REPORT (control poll).
+  std::map<uint8_t, std::vector<uint8_t>> report_cache_;
+  std::map<uint8_t, int> report_strikes_;
+  std::set<uint8_t> dead_reports_;        // GET_REPORT refuses/hangs on these
+  std::set<uint8_t> interrupt_seen_;      // report IDs already announced
+  bool interrupt_unsupported_{false};     // transport has no interrupt EP
+  size_t map_lines_logged_{0};            // FIELD MAP stream cap accounting
 };
 
 }  // namespace ups_hid
