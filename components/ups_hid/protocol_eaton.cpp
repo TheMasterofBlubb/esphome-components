@@ -126,6 +126,12 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   pending_logs_.emplace_back(line);
   ESP_LOGI(EATON_TAG, "HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
            fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+  // Stash only a bounded prefix of the map for the deferred re-logging: the
+  // full 5PX descriptor has hundreds of fields and queueing them all at boot
+  // wastes internal RAM (each entry is a heap string). read_data()'s
+  // first-cycle dump logs the complete map in a context that survives the
+  // boot flood anyway.
+  size_t queued = 0;
   for (const auto &f : fields_) {
     if (f.usage == 0)
       continue;  // padding/constant
@@ -133,8 +139,13 @@ bool EatonHidpdProtocol::fetch_and_parse() {
              f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
              static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
              path_to_string(f.path).c_str());
-    pending_logs_.emplace_back(line);
+    if (queued++ < 60)
+      pending_logs_.emplace_back(line);
     ESP_LOGD(EATON_TAG, "%s", line);
+  }
+  if (queued > 60) {
+    snprintf(line, sizeof(line), "  ... %zu more fields (full map dumped on first poll cycle)", queued - 60);
+    pending_logs_.emplace_back(line);
   }
   return true;
 }
@@ -289,7 +300,9 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
             // HID: if Report Count exceeds the usage list, the last usage repeats
             u = local_usages[c < local_usages.size() ? c : local_usages.size() - 1];
           }
-          if (tag == 0x80) {
+          if (tag == 0x80 && fields_.size() < 1500) {
+            // Hard cap: a malformed/vendored descriptor with huge Report
+            // Counts must not exhaust the heap.
             Field f;
             f.report_id = report_id;
             f.bit_offset = off;

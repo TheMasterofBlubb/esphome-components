@@ -529,7 +529,7 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     // VID/bcdDevice pair (drivers/libusb1.c). Fetch both indexes and keep the
     // larger answer — other devices simply STALL the index-1 request.
     // wLength is deliberately generous: a device answers with a short packet.
-    const uint16_t want = std::max<uint16_t>(report_desc_len, 1024);
+    const uint16_t want = std::min<uint16_t>(std::max<uint16_t>(report_desc_len, 1024), 2048);
     std::vector<uint8_t> best;
     uint8_t best_idx = 0;
     for (uint8_t idx = 0; idx <= 1; idx++) {
