@@ -625,6 +625,58 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         }
     }
 
+    // NUT-style interface probe: composite devices (e.g. the Eaton 5PX Gen2)
+    // can carry the reduced collection on one HID interface and the FULL
+    // measurement descriptor on another. Probe index 0/1 of every HID
+    // interface and keep the largest answer overall; rebind if the winner
+    // lives on a different interface than the one enumeration claimed.
+    uint8_t best_iface = device_.interface_num;
+    {
+      const usb_config_desc_t *cd = nullptr;
+      if (usb_host_get_active_config_descriptor(device_.dev_hdl, &cd) == ESP_OK && cd) {
+        int off = 0;
+        for (int i = 0; i < cd->bNumInterfaces; i++) {
+          const usb_intf_desc_t *it = usb_parse_interface_descriptor(cd, i, 0, &off);
+          if (!it || it->bInterfaceClass != USB_CLASS_HID)
+            continue;
+          const uint8_t iface = it->bInterfaceNumber;
+          if (iface == device_.interface_num)
+            continue;  // already probed above
+          for (uint8_t idx = 0; idx <= 1; idx++) {
+            std::vector<uint8_t> rd(want, 0);
+            size_t g = 0;
+            const esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
+                                           (kDescTypeHidReport << 8) | idx, iface, rd.data(), want, &g);
+            if (r == ESP_OK && g >= 8) {
+              rd.resize(g);
+              if (rd.size() > best.size()) {
+                best.swap(rd);
+                best_idx = idx;
+                best_iface = iface;
+                ESP_LOGI(ESP32_USB_TAG, "HID report descriptor if%u idx%u: %zu bytes (largest so far)", iface, idx,
+                         best.size());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (best_iface != device_.interface_num) {
+      ESP_LOGW(ESP32_USB_TAG, "Rebinding interface %u -> %u (larger report descriptor found there)",
+               static_cast<unsigned>(device_.interface_num), static_cast<unsigned>(best_iface));
+      usb_host_interface_release(device_.client_hdl, device_.dev_hdl, device_.interface_num);
+      device_.interface_num = best_iface;
+      const esp_err_t cr = usb_host_interface_claim(device_.client_hdl, device_.dev_hdl, best_iface, 0);
+      if (cr != ESP_OK)
+        ESP_LOGW(ESP32_USB_TAG, "Claim of interface %u failed: %s (EP0 GET_REPORT still works)",
+                 static_cast<unsigned>(best_iface), esp_err_to_name(cr));
+      device_.ep_in = 0;
+      device_.ep_out = 0;
+      if (find_endpoints() != ESP_OK)
+        ESP_LOGW(ESP32_USB_TAG, "Endpoint lookup on interface %u failed", static_cast<unsigned>(best_iface));
+    }
+
     if (best.empty()) {
         set_last_error("HID report descriptor read failed");
         return ESP_FAIL;
@@ -654,9 +706,10 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
             j += blen;
           }
         }
-        char tail[64];
-        snprintf(tail, sizeof(tail), "iface_used=%u ep_in=0x%02X kept_idx=%u len=%zu", static_cast<unsigned>(device_.interface_num),
-                 static_cast<unsigned>(device_.ep_in), static_cast<unsigned>(best_idx), best.size());
+        char tail[80];
+        snprintf(tail, sizeof(tail), "iface_used=%u ep_in=0x%02X kept=idx%u@if%u len=%zu",
+                 static_cast<unsigned>(device_.interface_num), static_cast<unsigned>(device_.ep_in),
+                 static_cast<unsigned>(best_idx), static_cast<unsigned>(best_iface), best.size());
         usb_topology_summary_ += tail;
     }
 
