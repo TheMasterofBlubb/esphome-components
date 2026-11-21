@@ -166,6 +166,12 @@ namespace esphome
       uint32_t max_consecutive_failures_{5};  // Limit re-detection attempts
       uint32_t detection_retry_after_{0};     // millis() before which detection is paused (0 = no back-off)
       static constexpr uint32_t DETECTION_BACKOFF_MS = 60000;  // Wait 60 s after repeated detection failures
+      // Protocol detection runs inside the boot config-dump burst, whose ~10 KB
+      // of log lines overruns even a large task log buffer - the detection
+      // trail is lost there. Capture it here and re-log it on the first normal
+      // poll cycle, where messages demonstrably survive.
+      std::string detection_notice_;
+      std::vector<std::string> pending_protocol_logs_;
       UpsData ups_data_;
       mutable std::mutex data_mutex_;  // Protect ups_data_ access
       
@@ -258,6 +264,12 @@ namespace esphome
       virtual bool read_data(UpsData &data) = 0;
       virtual DeviceInfo::DetectedProtocol get_protocol_type() const = 0;
       virtual std::string get_protocol_name() const = 0;
+
+      // Why initialize()/detect() failed (empty = unknown), and log lines the
+      // protocol wants printed but cannot from the detection context (boot log
+      // flood). The component pulls these and logs them on a later cycle.
+      virtual std::string get_last_error() const { return std::string(); }
+      virtual std::vector<std::string> take_pending_logs() { return std::vector<std::string>(); }
       
       // Beeper control methods
       virtual bool beeper_enable() { return false; }

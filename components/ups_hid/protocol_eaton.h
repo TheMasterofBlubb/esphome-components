@@ -44,6 +44,9 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   }
   std::string get_protocol_name() const override { return "Eaton HID PDC"; }
 
+  std::string get_last_error() const override { return last_error_; }
+  std::vector<std::string> take_pending_logs() override { return std::move(pending_logs_); }
+
  private:
   // A single collection level, e.g. {0x84, 0x1A} == "Power Device / Input".
   struct PathSeg {
@@ -107,6 +110,10 @@ class EatonHidpdProtocol : public UpsProtocolBase {
 
   // Cached USB string descriptors (read once in initialize()).
   std::string mfr_, model_, serial_;
+
+  // Diagnostics for the component's deferred logging (see UpsProtocolBase).
+  std::string last_error_;
+  std::vector<std::string> pending_logs_;  // [0] = summary, rest = field map
 };
 
 }  // namespace ups_hid

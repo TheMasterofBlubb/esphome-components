@@ -98,6 +98,8 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   std::vector<uint8_t> rd;
   const esp_err_t err = parent_->get_report_descriptor(rd);
   if (err != ESP_OK || rd.size() < 8) {
+    last_error_ = std::string("GET_DESCRIPTOR(0x22) failed: ") + esp_err_to_name(err) +
+                  " (" + std::to_string(rd.size()) + " bytes read)";
     ESP_LOGW(EATON_TAG, "No HID report descriptor available (%s) - this device needs another protocol",
              esp_err_to_name(err));
     return false;
@@ -105,21 +107,34 @@ bool EatonHidpdProtocol::fetch_and_parse() {
 
   descriptor_bytes_ = rd.size();
   if (!parse_descriptor(rd)) {
+    last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
+                  " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
     ESP_LOGW(EATON_TAG, "HID-PDC field map unusable (descriptor %u bytes, %zu fields)",
              static_cast<unsigned>(descriptor_bytes_), fields_.size());
     fields_.clear();
     return false;
   }
 
+  // Diagnostics for the component's deferred logging: the detection context is
+  // inside the boot log flood, so these ESP_LOG lines below are usually lost;
+  // the same content is queued here and re-logged on the first poll cycle.
+  last_error_.clear();
+  pending_logs_.clear();
+  char line[192];
+  snprintf(line, sizeof(line), "Eaton HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
+           fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+  pending_logs_.emplace_back(line);
   ESP_LOGI(EATON_TAG, "HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
            fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
   for (const auto &f : fields_) {
     if (f.usage == 0)
       continue;  // padding/constant
-    ESP_LOGD(EATON_TAG, "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
+    snprintf(line, sizeof(line), "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
              f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
              static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
              path_to_string(f.path).c_str());
+    pending_logs_.emplace_back(line);
+    ESP_LOGD(EATON_TAG, "%s", line);
   }
   return true;
 }

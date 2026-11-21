@@ -126,6 +126,18 @@ void UpsHidComponent::update() {
     update_sensors();
     consecutive_failures_ = 0;
     last_successful_read_ = millis();
+
+    // Re-log protocol-detection diagnostics that the boot log flood swallowed.
+    if (!detection_notice_.empty()) {
+      ESP_LOGW(TAG, "Protocol detection: %s", detection_notice_.c_str());
+      detection_notice_.clear();
+    }
+    if (!pending_protocol_logs_.empty()) {
+      ESP_LOGI(TAG, "%s", pending_protocol_logs_.front().c_str());
+      for (size_t i = 1; i < pending_protocol_logs_.size(); i++)
+        ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
+      pending_protocol_logs_.clear();
+    }
     
     // Check for timer updates (fast polling during countdowns)
     check_and_update_timers();
@@ -272,6 +284,8 @@ bool UpsHidComponent::detect_protocol() {
   }
   
   if (!active_protocol_) {
+    detection_notice_ = "protocol name \"" + protocol_selection_ +
+                        "\" not found in the component - the build lacks it";
     ESP_LOGE(TAG, "Failed to create protocol (selection: %s, vendor: 0x%04X)", 
              protocol_selection_.c_str(), vendor_id);
     return false;
@@ -282,6 +296,11 @@ bool UpsHidComponent::detect_protocol() {
   // Initialize the protocol (detection already done by factory)
   if (!active_protocol_->initialize()) {
     const std::string failed = active_protocol_->get_protocol_name();
+    // These boot-time log lines sit inside the config-dump flood and are
+    // usually lost; stash them so update() can re-log once the log runs dry.
+    const std::string why = active_protocol_->get_last_error();
+    detection_notice_ = failed + " failed to initialise" + (why.empty() ? std::string() : ": " + why);
+    pending_protocol_logs_ = active_protocol_->take_pending_logs();
     active_protocol_.reset();
     // Running with no protocol at all is worse than an approximate decode, so
     // retry with the heuristic protocol that needs no report descriptor.
@@ -302,6 +321,12 @@ bool UpsHidComponent::detect_protocol() {
   
   ESP_LOGI(TAG, "Protocol initialized: %s", 
            active_protocol_->get_protocol_name().c_str());
+  
+  // Defer the protocol's queued diagnostics (field map etc.) to the first
+  // poll cycle - the boot log window drops them otherwise.
+  auto queued = active_protocol_->take_pending_logs();
+  if (!queued.empty())
+    pending_protocol_logs_ = std::move(queued);
   
   // Set the detected protocol in ups_data_ after successful detection
   {
