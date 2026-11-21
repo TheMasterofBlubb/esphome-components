@@ -172,6 +172,7 @@ namespace esphome
       // poll cycle, where messages demonstrably survive.
       std::string detection_notice_;
       std::vector<std::string> pending_protocol_logs_;
+      int stash_drain_skips_{0};  // poll cycles to wait before draining stash
       UpsData ups_data_;
       mutable std::mutex data_mutex_;  // Protect ups_data_ access
       
@@ -234,6 +235,9 @@ namespace esphome
       
       // HID report descriptor (used by the descriptor-driven HID-PDC protocol)
       esp_err_t get_report_descriptor(std::vector<uint8_t>& descriptor);
+
+      // One-line USB topology summary (diagnostics; empty when unavailable)
+      std::string usb_topology_summary() const;
       
       // Transport information
       bool is_connected() const;

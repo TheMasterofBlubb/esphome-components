@@ -109,6 +109,7 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   map_dump_pos_ = 0;
   map_header_logged_ = false;
   decoded_shown_ = 0;
+  poll_cycles_ = 0;
   if (!parse_descriptor(rd)) {
     last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
                   " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
@@ -123,12 +124,21 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   // the same content is queued here and re-logged on the first poll cycle.
   last_error_.clear();
   pending_logs_.clear();
-  char line[192];
-  snprintf(line, sizeof(line), "Eaton HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
-           fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+  char line[240];
+  int used = snprintf(line, sizeof(line),
+                      "Eaton HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes) bits:",
+                      fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+  for (const uint8_t rid : input_reports_) {
+    if (used > 0 && used < static_cast<int>(sizeof(line)) - 14)
+      used += snprintf(line + used, sizeof(line) - used, " %02X/%u", rid, static_cast<unsigned>(input_bits_[rid]));
+  }
   pending_logs_.emplace_back(line);
-  ESP_LOGI(EATON_TAG, "HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes)",
-           fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+  ESP_LOGI(EATON_TAG, "%s", line);
+  const std::string topo = parent_->usb_topology_summary();
+  if (!topo.empty()) {
+    ESP_LOGI(EATON_TAG, "USB topology: %s", topo.c_str());
+    pending_logs_.emplace_back("USB topology: " + topo);
+  }
   // Stash only a small prefix of the map for the deferred re-logging (the
   // read_data() first-cycle dump streams the complete map in a context that
   // survives the boot flood anyway): the full 5PX descriptor has hundreds of
@@ -713,6 +723,7 @@ void EatonHidpdProtocol::publish(const Decoded &d, UpsData &data) const {
 bool EatonHidpdProtocol::read_data(UpsData &data) {
   if (fields_.empty() && !fetch_and_parse())
     return false;
+  poll_cycles_++;
 
   Decoded d;
   bool decoded_any = false;
@@ -725,7 +736,7 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
       ESP_LOGD(EATON_TAG, "GET_REPORT input 0x%02X failed: %s", report_id, esp_err_to_name(err));
       continue;
     }
-    if (first_cycle_)
+    if (poll_cycles_ >= 2 && poll_cycles_ <= 4)
       ESP_LOGD(EATON_TAG, "input report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
     else
       ESP_LOGV(EATON_TAG, "input report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
@@ -762,8 +773,9 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
   // First cycles: print the full picture here (this context demonstrably
   // survives logging, unlike the boot detection window). The dump is spread
   // across poll cycles a few lines at a time: hundreds of lines in one burst
-  // overflow the logger task buffer and everything gets dropped.
-  if (first_cycle_) {
+  // overflow the logger task buffer and everything gets dropped. Cycle 1 is
+  // skipped entirely — it collides with the boot-time config dump flood.
+  if (first_cycle_ && poll_cycles_ >= 2) {
     if (!map_header_logged_) {
       map_header_logged_ = true;
       ESP_LOGD(EATON_TAG, "FIELD MAP (%zu fields / %zu input reports, descriptor %u bytes):", fields_.size(),
@@ -789,7 +801,7 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
 
   // Repeat the value summary for its first cycles: if one cycle's log burst
   // gets dropped by the logger buffer, the summary still reaches the log.
-  if (decoded_shown_ < 3) {
+  if (decoded_shown_ < 3 && poll_cycles_ >= 2) {
     decoded_shown_++;
     ESP_LOGD(EATON_TAG,
              "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "

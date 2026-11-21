@@ -51,7 +51,12 @@ public:
         (void) timeout_ms;
         return ESP_ERR_NOT_SUPPORTED;
     }
-    
+
+    // One-line USB topology summary (interfaces, HID class descriptor lengths,
+    // which report-descriptor index was kept). Diagnostics only; empty when
+    // the transport has none.
+    virtual std::string get_usb_topology_summary() const { return std::string(); }
+
     // Error information
     virtual std::string get_last_error() const = 0;
 };

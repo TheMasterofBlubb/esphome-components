@@ -3,6 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 
+#include <cstdio>  // snprintf
 #include <new>  // std::nothrow
 
 #ifdef USE_ESP32
@@ -551,6 +552,18 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     esp_err_t ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
                                (kDescTypeConfiguration << 8) | 0, 0,
                                cfg.data(), cfg.size(), &got);
+    if (ret == ESP_OK && got > 3) {
+      // Devices with several interfaces can have a configuration descriptor
+      // longer than the first 255-byte probe; refetch the whole thing so the
+      // HID/interface scan below sees everything.
+      const size_t total = static_cast<size_t>(cfg[2] | (cfg[3] << 8));
+      if (total > cfg.size() && total <= 1024) {
+        cfg.assign(total, 0);
+        ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+                         (kDescTypeConfiguration << 8) | 0, 0,
+                         cfg.data(), cfg.size(), &got);
+      }
+    }
     if (ret == ESP_OK && got > cfg[0]) {
         // A composite device like the Eaton 5PX Gen2 lists SEVERAL HID class
         // descriptors in its configuration descriptor (one per report
@@ -615,6 +628,36 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     if (best.empty()) {
         set_last_error("HID report descriptor read failed");
         return ESP_FAIL;
+    }
+
+    // Diagnostic one-liner: interfaces + HID class descriptor lengths from
+    // the configuration descriptor, plus which report-descriptor index was
+    // kept. Surfaces via the protocol's deferred diagnostics so the boot-log
+    // flood cannot swallow it.
+    usb_topology_summary_.clear();
+    {
+        char seg[40];
+        if (cfg[0] > 0 && got > cfg[0]) {
+          for (size_t j = cfg[0]; j + 8 < got;) {
+            const uint8_t blen = cfg[j];
+            const uint8_t typ = cfg[j + 1];
+            if (blen < 2 || j + blen > got)
+              break;
+            if (typ == 0x04 && blen >= 9) {  // INTERFACE
+              snprintf(seg, sizeof(seg), "if%u.a%u.c%02X/%02X/%02X ", cfg[j + 2], cfg[j + 3], cfg[j + 5], cfg[j + 6],
+                       cfg[j + 7]);
+              usb_topology_summary_ += seg;
+            } else if (typ == kDescTypeHid && blen >= 8) {
+              snprintf(seg, sizeof(seg), "hid%u ", static_cast<unsigned>(cfg[j + 6] | (cfg[j + 7] << 8)));
+              usb_topology_summary_ += seg;
+            }
+            j += blen;
+          }
+        }
+        char tail[64];
+        snprintf(tail, sizeof(tail), "iface_used=%u ep_in=0x%02X kept_idx=%u len=%zu", static_cast<unsigned>(device_.interface_num),
+                 static_cast<unsigned>(device_.ep_in), static_cast<unsigned>(best_idx), best.size());
+        usb_topology_summary_ += tail;
     }
 
     descriptor.swap(best);

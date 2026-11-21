@@ -50,6 +50,8 @@ public:
     
     std::string get_last_error() const override;
 
+    std::string get_usb_topology_summary() const override { return usb_topology_summary_; }
+
 private:
     // USB device structure
     struct UsbDevice {
@@ -79,6 +81,10 @@ private:
     // Error handling
     mutable std::mutex error_mutex_;
     std::string last_error_;
+
+    // Diagnostic one-liner built during get_report_descriptor(): interfaces,
+    // HID class descriptor lengths, kept report-descriptor index.
+    std::string usb_topology_summary_;
     
     // Private methods
     static void usb_lib_task(void* arg);

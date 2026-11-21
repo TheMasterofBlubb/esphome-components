@@ -128,6 +128,11 @@ void UpsHidComponent::update() {
     detection_notice_.clear();
   }
   if (!pending_protocol_logs_.empty()) {
+    if (stash_drain_skips_ > 0) {
+      // Even the first poll cycle can still collide with the boot-time log
+      // flood; wait one more cycle before draining the stash.
+      stash_drain_skips_--;
+    } else {
     // Re-log a bounded slice per cycle: the full field-map stash (and the
     // protocol's first-cycle dump) in one burst overflows the logger task
     // buffer, and then NOTHING from the cycle survives.
@@ -139,6 +144,7 @@ void UpsHidComponent::update() {
         ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
     }
     pending_protocol_logs_.erase(pending_protocol_logs_.begin(), pending_protocol_logs_.begin() + n);
+    }
   }
 
   // Normal data reading with active protocol
@@ -228,6 +234,10 @@ esp_err_t UpsHidComponent::get_report_descriptor(std::vector<uint8_t>& descripto
     return ESP_ERR_INVALID_STATE;
   }
   return transport_->get_report_descriptor(descriptor);
+}
+
+std::string UpsHidComponent::usb_topology_summary() const {
+  return transport_ ? transport_->get_usb_topology_summary() : std::string();
 }
 
 bool UpsHidComponent::is_connected() const {
@@ -333,8 +343,10 @@ bool UpsHidComponent::detect_protocol() {
   // Defer the protocol's queued diagnostics (field map etc.) to the first
   // poll cycle - the boot log window drops them otherwise.
   auto queued = active_protocol_->take_pending_logs();
-  if (!queued.empty())
+  if (!queued.empty()) {
     pending_protocol_logs_ = std::move(queued);
+    stash_drain_skips_ = 1;
+  }
   
   // Set the detected protocol in ups_data_ after successful detection
   {

@@ -124,6 +124,7 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   bool map_header_logged_{false};
   size_t map_dump_pos_{0};
   int decoded_shown_{0};  // print the decoded summary on the first cycles
+  int poll_cycles_{0};    // poll cycles since the map was (re)fetched
 };
 
 }  // namespace ups_hid
