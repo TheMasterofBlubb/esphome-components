@@ -519,14 +519,26 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
 
     std::vector<uint8_t> rd(report_desc_len, 0);
     got = 0;
-    ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+    // HID report descriptors are per-interface; the SETUP recipient should be
+    // the interface, though many devices also answer a device-recipient
+    // request. Try the spec-correct one first, then the other.
+    const uint8_t std_in_iface = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                                 USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    ret = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
                      (kDescTypeHidReport << 8) | 0, device_.interface_num,
                      rd.data(), rd.size(), &got);
     if (ret != ESP_OK || got < 8) {
-        ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR failed: %s (%zu bytes)",
-                 esp_err_to_name(ret), got);
-        set_last_error("HID report descriptor read failed");
-        return (ret == ESP_OK) ? ESP_FAIL : ret;
+        const esp_err_t first = (ret == ESP_OK) ? ESP_FAIL : ret;
+        got = 0;
+        ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+                         (kDescTypeHidReport << 8) | 0, device_.interface_num,
+                         rd.data(), rd.size(), &got);
+        if (ret != ESP_OK || got < 8) {
+            ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR failed: %s after iface (%s), %zu bytes",
+                     esp_err_to_name(ret), esp_err_to_name(first), got);
+            set_last_error("HID report descriptor read failed");
+            return (ret == ESP_OK) ? ESP_FAIL : ret;
+        }
     }
 
     rd.resize(got);
