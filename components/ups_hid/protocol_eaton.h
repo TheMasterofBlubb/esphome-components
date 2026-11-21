@@ -93,6 +93,7 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   bool read_strings();
 
   bool in_path(const Field &f, uint16_t page, uint16_t usage) const;
+  int collection_index(const Field &f, uint16_t page, uint16_t usage) const;
   bool in_battery_collection(const Field &f) const;
   bool eaton_offset_candidate(const Field &f) const;
   float scaled_value(const Field &f, uint32_t raw, bool measurement) const;
@@ -114,6 +115,10 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   // Diagnostics for the component's deferred logging (see UpsProtocolBase).
   std::string last_error_;
   std::vector<std::string> pending_logs_;  // [0] = summary, rest = field map
+  // read_data() runs in the normal poll window (unlike detection, which sits
+  // inside the boot config-dump flood), so the first cycle also dumps the
+  // field map, raw report bytes and decoded values at DEBUG. One-shot.
+  bool first_cycle_{true};
 };
 
 }  // namespace ups_hid

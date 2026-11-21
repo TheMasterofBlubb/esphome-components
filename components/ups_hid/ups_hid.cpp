@@ -121,23 +121,24 @@ void UpsHidComponent::update() {
     }
   }
   
+  // Re-log protocol-detection diagnostics that the boot log flood swallowed;
+  // runs at the top of the cycle, independent of the read outcome.
+  if (!detection_notice_.empty()) {
+    ESP_LOGW(TAG, "Protocol detection: %s", detection_notice_.c_str());
+    detection_notice_.clear();
+  }
+  if (!pending_protocol_logs_.empty()) {
+    ESP_LOGI(TAG, "%s", pending_protocol_logs_.front().c_str());
+    for (size_t i = 1; i < pending_protocol_logs_.size(); i++)
+      ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
+    pending_protocol_logs_.clear();
+  }
+
   // Normal data reading with active protocol
   if (read_ups_data()) {
     update_sensors();
     consecutive_failures_ = 0;
     last_successful_read_ = millis();
-
-    // Re-log protocol-detection diagnostics that the boot log flood swallowed.
-    if (!detection_notice_.empty()) {
-      ESP_LOGW(TAG, "Protocol detection: %s", detection_notice_.c_str());
-      detection_notice_.clear();
-    }
-    if (!pending_protocol_logs_.empty()) {
-      ESP_LOGI(TAG, "%s", pending_protocol_logs_.front().c_str());
-      for (size_t i = 1; i < pending_protocol_logs_.size(); i++)
-        ESP_LOGD(TAG, "%s", pending_protocol_logs_[i].c_str());
-      pending_protocol_logs_.clear();
-    }
     
     // Check for timer updates (fast polling during countdowns)
     check_and_update_timers();

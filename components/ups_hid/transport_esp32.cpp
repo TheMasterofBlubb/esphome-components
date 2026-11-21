@@ -517,34 +517,52 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
         ESP_LOGD(ESP32_USB_TAG, "HID class descriptor not found in config descriptor, trying 1024 bytes");
     }
 
-    std::vector<uint8_t> rd(report_desc_len, 0);
-    got = 0;
     // HID report descriptors are per-interface; the SETUP recipient should be
     // the interface, though many devices also answer a device-recipient
     // request. Try the spec-correct one first, then the other.
     const uint8_t std_in_iface = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD |
                                  USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
-    ret = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
-                     (kDescTypeHidReport << 8) | 0, device_.interface_num,
-                     rd.data(), rd.size(), &got);
-    if (ret != ESP_OK || got < 8) {
-        const esp_err_t first = (ret == ESP_OK) ? ESP_FAIL : ret;
-        got = 0;
-        ret = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
-                         (kDescTypeHidReport << 8) | 0, device_.interface_num,
-                         rd.data(), rd.size(), &got);
-        if (ret != ESP_OK || got < 8) {
-            ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR failed: %s after iface (%s), %zu bytes",
-                     esp_err_to_name(ret), esp_err_to_name(first), got);
-            set_last_error("HID report descriptor read failed");
-            return (ret == ESP_OK) ? ESP_FAIL : ret;
+
+    // Eaton 5PX Gen2 (VID 0x0463, bcdDevice 0x0202) exposes a REDUCED report
+    // descriptor at index 0 and the full one (input/output metrics, SOC, load,
+    // status) at index 1; NUT forces usb_hid_desc_index=1 for exactly that
+    // VID/bcdDevice pair (drivers/libusb1.c). Fetch both indexes and keep the
+    // larger answer — other devices simply STALL the index-1 request.
+    // wLength is deliberately generous: a device answers with a short packet.
+    const uint16_t want = std::max<uint16_t>(report_desc_len, 1024);
+    std::vector<uint8_t> best;
+    uint8_t best_idx = 0;
+    for (uint8_t idx = 0; idx <= 1; idx++) {
+        std::vector<uint8_t> rd(want, 0);
+        size_t g = 0;
+        esp_err_t r = control_in(std_in_iface, USB_B_REQUEST_GET_DESCRIPTOR,
+                                 (kDescTypeHidReport << 8) | idx, device_.interface_num,
+                                 rd.data(), want, &g);
+        if (r != ESP_OK || g < 8) {
+            g = 0;
+            r = control_in(std_in, USB_B_REQUEST_GET_DESCRIPTOR,
+                           (kDescTypeHidReport << 8) | idx, device_.interface_num,
+                           rd.data(), want, &g);
+        }
+        if (r == ESP_OK && g >= 8) {
+            rd.resize(g);
+            if (rd.size() > best.size()) {
+                best.swap(rd);
+                best_idx = idx;
+            }
+        } else if (idx == 0) {
+            ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR index 0 failed: %s", esp_err_to_name(r));
         }
     }
 
-    rd.resize(got);
-    descriptor.swap(rd);
-    ESP_LOGI(ESP32_USB_TAG, "HID report descriptor: %zu bytes (wDescriptorLength=%u)",
-             descriptor.size(), static_cast<unsigned>(report_desc_len));
+    if (best.empty()) {
+        set_last_error("HID report descriptor read failed");
+        return ESP_FAIL;
+    }
+
+    descriptor.swap(best);
+    ESP_LOGI(ESP32_USB_TAG, "HID report descriptor: %zu bytes (index %u, wDescriptorLength=%u)",
+             descriptor.size(), static_cast<unsigned>(best_idx), static_cast<unsigned>(report_desc_len));
     return ESP_OK;
 }
 

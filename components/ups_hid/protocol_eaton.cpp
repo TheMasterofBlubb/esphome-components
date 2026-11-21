@@ -255,12 +255,24 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
       case 0xA0:  // Collection - the collection's usage is the pending Usage item
         if (!local_usages.empty())
           path.push_back({page, local_usages.back()});
+        // Eaton/PowerDesign descriptors encode arrays of same-usage
+        // collections as Collection(0x80|n); NUT tracks these as 0x00ff|n
+        // path nodes so "Input.[1]", "Input.[2]", ... stay distinguishable.
+        // Mirror that exactly.
+        if (val >= 0x80)
+          path.push_back({0x00FF, static_cast<uint16_t>(val & 0x7F)});
         local_usages.clear();
         has_range = false;
         break;
       case 0xC0:  // End Collection
-        if (!path.empty())
+        // An indexed collection pushed two nodes; End Collection pops both
+        // (same rule as NUT's ITEM_END_COLLECTION handling).
+        if (!path.empty()) {
+          const PathSeg popped = path.back();
           path.pop_back();
+          if (popped.page == 0x00FF && !path.empty())
+            path.pop_back();
+        }
         local_usages.clear();
         has_range = false;
         break;
@@ -345,6 +357,17 @@ bool EatonHidpdProtocol::in_path(const Field &f, uint16_t page, uint16_t usage) 
   return false;
 }
 
+// NUT-style disambiguation of indexed collections: returns the "[n]" instance
+// number following a collection segment, or -1 when the collection carries no
+// index node (single-instance devices).
+int EatonHidpdProtocol::collection_index(const Field &f, uint16_t page, uint16_t usage) const {
+  for (size_t k = 0; k + 1 < f.path.size(); k++) {
+    if (f.path[k].page == page && f.path[k].usage == usage && f.path[k + 1].page == 0x00FF)
+      return f.path[k + 1].usage;
+  }
+  return -1;
+}
+
 bool EatonHidpdProtocol::eaton_offset_candidate(const Field &f) const {
   if (f.size != 8 && f.size != 16 && f.size != 32)
     return false;
@@ -391,6 +414,9 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
     return;
 
   const bool battery_ctx = battery_page || in_battery_collection(f);
+  // NUT's Eaton (mge-hid) subdriver reads most 5P/5PX/5SC values from the
+  // PowerSummary collection rather than Battery/Input/Output collections.
+  const bool summary_ctx = in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_POWER_SUMMARY);
 
   // --- status bits: 1-bit fields ------------------------------------------
   if (f.size == 1) {
@@ -433,6 +459,20 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
         if (set)
           d.online = true;
         break;
+      case HID_USAGE_POW_USED:
+        // "PowerConverter.Input.[1].PresentStatus.Used" => utility converter
+        // feeding the load (online); "Input.[3]...Used" => energy comes from
+        // the battery-side converter (on battery) — NUT mge-hid semantics.
+        if (in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_INPUT)) {
+          const int idx = collection_index(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_INPUT);
+          if (idx == 3)
+            d.on_battery = d.on_battery || set;
+          else
+            d.online = d.online || set;
+        } else if (set && summary_ctx) {
+          d.online = true;
+        }
+        break;
       case HID_USAGE_POW_GOOD:
         if (set)
           d.online = true;
@@ -466,8 +506,15 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
       case HID_USAGE_POW_VOLTAGE:
         if (battery_ctx) {
           d.voltage_battery = v;
+        } else if (summary_ctx) {
+          // NUT mge-hid: PowerSummary.Voltage is the battery voltage on the
+          // Eaton 5P/5PX/5SC series (mge_battery_voltage_fun).
+          d.voltage_battery = v;
         } else if (in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_INPUT)) {
-          d.voltage_input = v;
+          // First Input collection wins == "Input.[1]" in NUT's paths; the
+          // bypass/secondary inputs ([2]/[3]) carry near-identical values.
+          if (isnan_(d.voltage_input))
+            d.voltage_input = v;
         } else if (in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_OUTPUT)) {
           d.voltage_output = v;
         } else if (v < 60.0f) {
@@ -479,7 +526,9 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
         }
         break;
       case HID_USAGE_POW_CONFIG_VOLTAGE:
-        if (battery_ctx) {
+        if (battery_ctx || summary_ctx) {
+          // PowerSummary.ConfigVoltage = nominal battery voltage on 5P-series
+          // (mge_battery_voltage_nominal_fun in NUT).
           d.voltage_nom_battery = v;
         } else if (in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_OUTPUT)) {
           d.voltage_nom_output = v;
@@ -522,9 +571,11 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
       d.battery_level = (f.unit == 0 && f.unit_exp == -2) ? v * 100.0f : v;
       break;
     case HID_USAGE_BAT_REMAINING_CAPACITY:
-      if (f.unit == 0 && f.unit_exp == -2) {
-        d.battery_level = v * 100.0f;
-      } else if (f.unit == 0 && f.log_max >= 0 && f.log_max <= 100) {
+      // NUT mge-hid maps battery.charge straight to PowerSummary.RemainingCapacity.
+      // Percent fields declare unit 0 (none/percent), so the descriptor-scaled
+      // value is already a percentage; a field with a real capacity unit (As)
+      // is kept as raw capacity instead.
+      if (f.unit == 0) {
         d.battery_level = v;
       } else {
         d.remaining_capacity = v;
@@ -659,7 +710,10 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
       ESP_LOGD(EATON_TAG, "GET_REPORT input 0x%02X failed: %s", report_id, esp_err_to_name(err));
       continue;
     }
-    ESP_LOGV(EATON_TAG, "input report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
+    if (first_cycle_)
+      ESP_LOGD(EATON_TAG, "input report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
+    else
+      ESP_LOGV(EATON_TAG, "input report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
 
     const uint8_t *body = buf;
     size_t body_len = len;
@@ -688,6 +742,30 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
                  scaled_value(f, raw, false));
       }
     }
+  }
+
+  // First cycle: print the full picture here (this context demonstrably
+  // survives logging, unlike the boot detection window).
+  if (first_cycle_) {
+    first_cycle_ = false;
+    ESP_LOGD(EATON_TAG, "FIELD MAP (%zu fields / %zu input reports, descriptor %u bytes):", fields_.size(),
+             input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+    for (const auto &f : fields_) {
+      if (f.usage == 0)
+        continue;
+      ESP_LOGD(EATON_TAG, "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
+               f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
+               static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
+               path_to_string(f.path).c_str());
+    }
+    ESP_LOGD(EATON_TAG,
+             "decoded: Vin=%.1f Vout=%.1f Vbat=%.1f nomBat=%.1f SOC=%.0f load=%.0f f=%.1f run=%.0fs | "
+             "online=%d onbat=%d chg=%d full=%d ovld=%d fail=%d volimit=%d",
+             d.voltage_input, d.voltage_output, d.voltage_battery, d.voltage_nom_battery, d.battery_level,
+             d.load_percent, d.frequency, d.runtime_seconds, static_cast<int>(d.online),
+             static_cast<int>(d.on_battery), static_cast<int>(d.charging), static_cast<int>(d.fully_charged),
+             static_cast<int>(d.overload), static_cast<int>(d.internal_failure),
+             static_cast<int>(d.voltage_out_of_range));
   }
 
   if (!decoded_any)

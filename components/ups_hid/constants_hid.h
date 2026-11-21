@@ -86,6 +86,10 @@
 #define HID_USAGE_POW_OVER_CHARGED              0x0066
 #define HID_USAGE_POW_SHUTDOWN_REQUESTED        0x0068
 #define HID_USAGE_POW_SHUTDOWN_IMMINENT         0x0069
+#define HID_USAGE_POW_SWITCHABLE                0x006C
+#define HID_USAGE_POW_USED                      0x006D
+#define HID_USAGE_POW_BOOST                     0x006E
+#define HID_USAGE_POW_BUCK                      0x006F
 
 // Device Information
 #define HID_USAGE_POW_I_MANUFACTURER            0x00FD
