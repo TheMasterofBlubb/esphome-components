@@ -59,14 +59,6 @@ static int unit_scale_expo(int32_t unit, int32_t unit_exp) {
 }
 
 namespace {
-// Two's complement of a descriptor item of `bits` width.
-int32_t sign_extend(uint32_t v, uint8_t bits) {
-  if (bits == 0 || bits >= 32)
-    return static_cast<int32_t>(v);
-  const uint32_t m = 1u << (bits - 1);
-  return static_cast<int32_t>((v ^ m) - m);
-}
-
 bool isnan_(float v) { return std::isnan(v); }
 
 float clamp_pct(float v) {
@@ -204,6 +196,47 @@ bool EatonHidpdProtocol::read_strings() {
 }
 
 // ------------------------------------------------------------ HID descriptor
+//
+// The item walk below is a faithful port of Network UPS Tools' HID parser
+// (drivers/hidparser.c in networkupstools/nut, GPL-2.0+), plus the value
+// handling of drivers/libhid.c further down in this file. Semantics that
+// matter on real UPS firmware and are kept exactly:
+//  * the usage queue: only Usage items push nodes; Usage Min/Max items are
+//    NOT tracked, so Eaton's trailing 0xFE/0xFF usage-array reports produce
+//    no fields at all (NUT never reads those reports either),
+//  * Report-Count continuation: one field per count unit reusing the same
+//    main-item prefix until the count is exhausted; fields whose usage slot
+//    is empty are continuations and are dropped (offset book-keeping
+//    continues),
+//  * Collection items consume the queue head and may push an index node
+//    (0x00ff0000|n == "Input.[n]"); End Collection pops it,
+//  * Unit Exponent items are 4-bit signed (values > 7 mean negative),
+//  * a LogMax that reads as < LogMin is reinterpreted unsigned (firmware
+//    encoded 0..65535 in two bytes),
+//  * a 4-byte Usage item's value is already a full (page<<16|usage) node.
+
+namespace {
+constexpr uint8_t kItemUsage = 0x08, kItemUPage = 0x04, kItemLogMin = 0x14, kItemLogMax = 0x24,
+                  kItemPhyMin = 0x34, kItemPhyMax = 0x44, kItemUnitExp = 0x54, kItemUnit = 0x64,
+                  kItemRepSize = 0x74, kItemRepId = 0x84, kItemRepCount = 0x94,
+                  kItemCollection = 0xA0, kItemEndCollection = 0xC0, kItemLong = 0xFC,
+                  kItemInput = 0x80, kItemOutput = 0x90, kItemFeature = 0xB0;
+constexpr uint8_t kItemMask = 0xFC, kSizeMask = 0x03;
+constexpr uint8_t kItemDataBytes[4] = {0, 1, 2, 4};
+constexpr size_t kNutPathSize = 10;   // NUT PATH_SIZE
+constexpr size_t kNutMaxItems = 500;  // NUT MAX_REPORT (parsed-item cap)
+
+int32_t nut_format_value(uint32_t v, uint8_t bytes) {
+  switch (bytes) {
+    case 1:
+      return static_cast<int8_t>(v);
+    case 2:
+      return static_cast<int16_t>(v);
+    default:
+      return static_cast<int32_t>(v);  // 4 bytes (and 0 -> v == 0)
+  }
+}
+}  // namespace
 
 bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
   fields_.clear();
@@ -212,167 +245,235 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
   feature_reports_.clear();
   feature_bits_.clear();
 
-  uint16_t report_size = 0;
-  uint16_t report_count = 0;
-  uint8_t report_id = 0;
-  uint16_t page = 0;
-  int32_t log_min = 0;
-  int32_t log_max = 0;
-  uint32_t log_max_raw = 0;
-  uint8_t log_max_bits = 0;
-  int32_t unit = 0;
-  int32_t unit_exp = 0;
-  bool has_range = false;
-  uint16_t range_min = 0;
-  uint16_t range_max = 0;
-  std::vector<uint16_t> local_usages;
+  // NUT HIDParser_t state
+  struct State {
+    size_t pos{0};
+    uint8_t item{0};
+    uint32_t value{0};
+    uint16_t upage{0};
+    std::vector<uint32_t> usage_tab;  // NUT UsageTab (queue), sized like NUT's
+    size_t usage_size{0};
+    uint32_t nodes[kNutPathSize];
+    size_t path_size{0};
+    uint8_t count{0};          // per-prefix continuation counter
+    uint8_t report_count{0};   // Report Count global
+    // NUT's persistent "Data" (global item context):
+    uint8_t report_id{0};
+    uint8_t size{0};
+    int32_t log_min{0}, log_max{0};
+    int32_t phy_min{0}, phy_max{0};
+    bool have_phy_min{false}, have_phy_max{false};
+    int32_t unit{0};
+    int8_t unit_exp{0};
+    bool assumed_logmax{false};
+    std::map<uint16_t, uint32_t> offsets;  // (report_id<<8)|item-type -> payload bit cursor
+  } st;
+  st.usage_tab.assign(std::max<size_t>(rd.size(), 50), 0);  // NUT: max(desc size, USAGE_TAB_SIZE)
 
-  std::vector<PathSeg> path;
-  std::map<uint8_t, uint32_t> bit_in;    // per report ID, independent bit cursors
-  std::map<uint8_t, uint32_t> bit_feat;
+  // NUT ResetLocalState(): clears the usage queue only; globals persist.
+  auto reset_local = [&st]() {
+    st.usage_size = 0;
+    std::fill(st.usage_tab.begin(), st.usage_tab.end(), 0u);
+  };
+  // NUT's "unstack": shift the queue left by one.
+  auto unstack_usage = [&st]() {
+    if (st.usage_size == 0)
+      return;
+    for (size_t j = 0; j < st.usage_size; j++)
+      st.usage_tab[j] = (j + 1 < st.usage_tab.size()) ? st.usage_tab[j + 1] : 0;
+    st.usage_size--;
+  };
 
-  size_t i = 0;
-  while (i < rd.size()) {
-    const uint8_t b = rd[i];
-    if (b == 0xFE) {  // long item: 0xFE, byte count, payload
-      if (i + 1 >= rd.size())
-        break;
-      const size_t n = rd[i + 1];
-      i += 2 + n;
-      continue;
-    }
-    uint8_t sz = b & 0x03;
-    if (sz == 3)
-      sz = 4;
-    if (i + 1 + sz > rd.size())
-      break;  // truncated descriptor
-    const uint8_t tag = b & 0xFC;  // 6-bit tag + 2-bit size
-    uint32_t val = 0;
-    for (uint8_t k = 0; k < sz; k++)
-      val |= static_cast<uint32_t>(rd[i + 1 + k]) << (8 * k);
-    i += 1 + sz;
-
-    switch (tag) {
-      case 0x04:  // Usage Page
-        // Standard UPS descriptors use 1-byte pages (0x84 / 0x85). Some vendor
-        // firmware emits a wide page item whose value also carries the usage in
-        // the low byte (0x8404); normalise so the usage-page comparisons hold.
-        if (val > 0xFF) {
-          ESP_LOGD(EATON_TAG, "usage page 0x%04X normalised to 0x%02X", static_cast<unsigned>(val),
-                   static_cast<unsigned>(val >> 8));
-          page = static_cast<uint16_t>(val >> 8);
-        } else {
-          page = static_cast<uint16_t>(val);
+  // NUT HIDParse(): advance until one data item is produced; returns 1 (real
+  // object), 0 (continuation with empty usage slot) or -1 (truncated/overflow).
+  auto parse_one = [&](Field &f) -> int {
+    int found = -1;
+    while (found < 0 && st.pos < rd.size()) {
+      if (st.count == 0) {
+        st.item = rd[st.pos++];
+        st.value = 0;
+        const uint8_t data_bytes = kItemDataBytes[st.item & kSizeMask];
+        if (static_cast<size_t>(data_bytes) > rd.size() - st.pos) {
+          ESP_LOGW(EATON_TAG, "truncated HID item, aborting descriptor parse");
+          return -1;
         }
-        break;
-      case 0x08:  // Usage - part of a local usage list
-        local_usages.push_back(static_cast<uint16_t>(val));
-        break;
-      case 0x18:  // Usage Minimum
-        range_min = static_cast<uint16_t>(val);
-        has_range = true;
-        break;
-      case 0x28:  // Usage Maximum
-        range_max = static_cast<uint16_t>(val);
-        has_range = true;
-        break;
-      case 0x14:  // Logical Minimum
-        log_min = sign_extend(val, static_cast<uint8_t>(sz * 8));
-        break;
-      case 0x24:  // Logical Maximum
-        log_max_raw = val;
-        log_max = sign_extend(val, static_cast<uint8_t>(sz * 8));
-        log_max_bits = static_cast<uint8_t>(sz * 8);
-        // Vendors sometimes encode a full unsigned range in too few bytes, so
-        // that it reads as a negative number (NUT does the same reinterpation).
-        if (log_max < log_min)
-          log_max = static_cast<int32_t>(val | (0xFFFFu << log_max_bits));
-        break;
-      case 0x54:  // Unit Exponent (log10 multiplier)
-        unit_exp = sign_extend(val, static_cast<uint8_t>(sz * 8));
-        break;
-      case 0x64:  // Unit
-        unit = static_cast<int32_t>(val);
-        break;
-      case 0x74:  // Report Size
-        report_size = static_cast<uint16_t>(val);
-        break;
-      case 0x94:  // Report Count
-        report_count = static_cast<uint16_t>(val);
-        break;
-      case 0x84:  // Report ID
-        report_id = static_cast<uint8_t>(val);
-        break;
-      case 0xA0:  // Collection - the collection's usage is the pending Usage item
-        if (!local_usages.empty())
-          path.push_back({page, local_usages.back()});
-        // Eaton/PowerDesign descriptors encode arrays of same-usage
-        // collections as Collection(0x80|n); NUT tracks these as 0x00ff|n
-        // path nodes so "Input.[1]", "Input.[2]", ... stay distinguishable.
-        // Mirror that exactly.
-        if (val >= 0x80)
-          path.push_back({0x00FF, static_cast<uint16_t>(val & 0x7F)});
-        local_usages.clear();
-        has_range = false;
-        break;
-      case 0xC0:  // End Collection
-        // An indexed collection pushed two nodes; End Collection pops both
-        // (same rule as NUT's ITEM_END_COLLECTION handling).
-        if (!path.empty()) {
-          const PathSeg popped = path.back();
-          path.pop_back();
-          if (popped.page == 0x00FF && !path.empty())
-            path.pop_back();
-        }
-        local_usages.clear();
-        has_range = false;
-        break;
-      case 0x80:  // Input (0x81 = 0x80 | size 1)
-      case 0xB0: {  // Feature (0xB1)
-        std::map<uint8_t, uint32_t> &bits = (tag == 0x80) ? bit_in : bit_feat;
-        uint32_t &off = bits[report_id];
-        const uint16_t r_hi = std::max(range_min, range_max);
-        for (uint16_t c = 0; c < report_count; c++) {
-          uint16_t u = 0;
-          if (has_range) {
-            u = static_cast<uint16_t>(std::min<uint32_t>(range_min + c, r_hi));
-          } else if (!local_usages.empty()) {
-            // HID: if Report Count exceeds the usage list, the last usage repeats
-            u = local_usages[c < local_usages.size() ? c : local_usages.size() - 1];
-          }
-          if (fields_.size() < 1500) {
-            // Hard cap: a malformed/vendored descriptor with huge Report
-            // Counts must not exhaust the heap.
-            Field f;
-            f.report_id = report_id;
-            f.bit_offset = off;
-            f.size = report_size;
-            f.page = page;
-            // An array of constants carries no usage; fields with usage 0 are
-            // still needed so the bit offsets of the following fields line up.
-            f.usage = u;
-            f.is_feature = (tag != 0x80);
-            f.log_min = log_min;
-            f.log_max = log_max;
-            f.log_max_raw = log_max_raw;
-            f.log_max_bits = log_max_bits;
-            f.unit = unit;
-            f.unit_exp = unit_exp;
-            f.path = path;
-            fields_.push_back(f);
-          }
-          off += report_size;
-        }
-        // Local items are consumed by the Main item that follows them
-        local_usages.clear();
-        has_range = false;
-        break;
+        for (uint8_t k = 0; k < data_bytes; k++)
+          st.value |= static_cast<uint32_t>(rd[st.pos + k]) << (8 * k);
+        st.pos += data_bytes;
       }
-      default:
-        break;  // Physical Min/Max, String Index, Set Report, Local items, ...
+
+      switch (st.item & kItemMask) {
+        case kItemUPage:
+          st.upage = static_cast<uint16_t>(st.value);
+          break;
+        case kItemUsage:
+          if (st.usage_size >= st.usage_tab.size()) {
+            ESP_LOGW(EATON_TAG, "HID usage stack overflow, aborting descriptor parse");
+            return -1;
+          }
+          if ((st.item & kSizeMask) > 2) {
+            st.usage_tab[st.usage_size] = st.value;  // 4-byte: full page<<16|usage node
+          } else {
+            st.usage_tab[st.usage_size] = (static_cast<uint32_t>(st.upage) << 16) | (st.value & 0xFFFF);
+          }
+          st.usage_size++;
+          break;
+        case kItemCollection:
+          if (st.path_size >= kNutPathSize) {
+            ESP_LOGW(EATON_TAG, "HID path too long, aborting descriptor parse");
+            return -1;
+          }
+          st.nodes[st.path_size++] = st.usage_tab[0];
+          unstack_usage();
+          if (st.value >= 0x80) {  // indexed collection ("Flow.[1]" etc.)
+            if (st.path_size >= kNutPathSize) {
+              ESP_LOGW(EATON_TAG, "HID path too long, aborting descriptor parse");
+              return -1;
+            }
+            st.nodes[st.path_size++] = 0x00FF0000u | (st.value & 0x7F);
+          }
+          reset_local();
+          break;
+        case kItemEndCollection:
+          if (st.path_size == 0) {
+            ESP_LOGW(EATON_TAG, "unbalanced HID End Collection, aborting descriptor parse");
+            return -1;
+          }
+          st.path_size--;
+          if (st.path_size > 0 && (st.nodes[st.path_size] & 0xFFFF0000u) == 0x00FF0000u)
+            st.path_size--;
+          reset_local();
+          break;
+        case kItemInput:
+        case kItemOutput:
+        case kItemFeature: {
+          const uint8_t type = st.item & kItemMask;
+          found = (st.usage_tab[0] != 0) ? 1 : 0;
+          if (st.count == 0)
+            st.count = st.report_count;
+          if (st.path_size >= kNutPathSize) {
+            ESP_LOGW(EATON_TAG, "HID path too long, aborting descriptor parse");
+            return -1;
+          }
+          const uint32_t usage_node = st.usage_tab[0];
+
+          f.report_id = st.report_id;
+          f.assumed_logmax = st.assumed_logmax;
+          uint32_t &cur = st.offsets[(static_cast<uint16_t>(st.report_id) << 8) | type];
+          f.bit_offset = cur;
+          cur += st.size;
+          f.size = st.size;
+          f.is_feature = (type == kItemFeature);
+          f.page = static_cast<uint16_t>(usage_node >> 16);
+          f.usage = static_cast<uint16_t>(usage_node & 0xFFFF);
+          f.log_min = st.log_min;
+          f.log_max = st.log_max;
+          f.phy_min = st.phy_min;
+          f.phy_max = st.phy_max;
+          f.have_phy_min = st.have_phy_min;
+          f.have_phy_max = st.have_phy_max;
+          f.unit = st.unit;
+          f.unit_exp = st.unit_exp;
+          f.path.clear();
+          f.path.reserve(st.path_size);
+          for (size_t k = 0; k < st.path_size; k++)
+            f.path.push_back({static_cast<uint16_t>(st.nodes[k] >> 16), static_cast<uint16_t>(st.nodes[k] & 0xFFFF)});
+
+          st.path_size--;  // NUT: remove the usage node (it became page/usage above)
+          unstack_usage();
+          if (--st.count == 0)
+            reset_local();
+          break;
+        }
+        case kItemRepId:
+          st.report_id = static_cast<uint8_t>(st.value);
+          break;
+        case kItemRepSize:
+          st.size = static_cast<uint8_t>(st.value);
+          break;
+        case kItemRepCount:
+          st.report_count = static_cast<uint8_t>(st.value);
+          break;
+        case kItemUnitExp: {
+          // NUT: int8 cast, then values > 7 are negative 4-bit nibbles.
+          int8_t e = static_cast<int8_t>(st.value);
+          if (e > 7)
+            e |= static_cast<int8_t>(0xF0);
+          st.unit_exp = e;
+          break;
+        }
+        case kItemUnit:
+          st.unit = static_cast<int32_t>(st.value);
+          break;
+        case kItemLogMin:
+          st.log_min = nut_format_value(st.value, kItemDataBytes[st.item & kSizeMask]);
+          break;
+        case kItemLogMax: {
+          const int32_t v = nut_format_value(st.value, kItemDataBytes[st.item & kSizeMask]);
+          if (v < st.log_min) {
+            // NUT hack: vendor encoded a full unsigned range in too few bytes.
+            ESP_LOGD(EATON_TAG, "LogMax %d < LogMin %d in report 0x%02X; interpreting as %u",
+                     static_cast<int>(v), static_cast<int>(st.log_min), st.report_id,
+                     static_cast<unsigned>(st.value));
+            st.assumed_logmax = true;
+            st.log_max = static_cast<int32_t>(st.value);
+          } else {
+            st.log_max = v;
+            st.assumed_logmax = false;
+          }
+          break;
+        }
+        case kItemPhyMin:
+          st.phy_min = nut_format_value(st.value, kItemDataBytes[st.item & kSizeMask]);
+          st.have_phy_min = true;
+          break;
+        case kItemPhyMax:
+          st.phy_max = nut_format_value(st.value, kItemDataBytes[st.item & kSizeMask]);
+          st.have_phy_max = true;
+          break;
+        case kItemLong:
+          // NUT: can't handle long items, but skip their payload.
+          st.pos += static_cast<uint8_t>(st.value & 0xFF);
+          break;
+        default:
+          break;  // Usage Min/Max, String, Set Report, ... (NUT ignores these too)
+      }
+    }
+    return found;
+  };
+
+  // NUT Parse_ReportDesc() driver loop: continuation items (found == 0) are
+  // discarded (their offset book-keeping already advanced via the persistent
+  // offsets map); OUTPUT items are parsed for offset book-keeping but never
+  // decoded; and vendor-page (0xFF) usages are dropped outright - they
+  // produced the 0xFE/0xFF report flood in the v10 FIELD MAP and made the
+  // GET_REPORT sweep miss the useful feature reports (cycle budget).
+  while (fields_.size() < kNutMaxItems) {
+    Field f;
+    const int ret = parse_one(f);
+    if (ret < 0)
+      break;
+    if (ret == 0)
+      continue;
+    if (f.page == 0x00FF)
+      continue;
+    fields_.push_back(f);
+  }
+  if (fields_.size() >= kNutMaxItems && st.pos < rd.size())
+    ESP_LOGW(EATON_TAG, "too many HID objects: descriptor parse capped at %zu items", kNutMaxItems);
+
+  std::map<uint8_t, uint32_t> bit_in, bit_feat;
+  for (const auto &f : fields_) {
+    if (f.is_feature) {
+      const uint32_t end = f.bit_offset + f.size;
+      if (end > bit_feat[f.report_id])
+        bit_feat[f.report_id] = end;
+    } else {
+      const uint32_t end = f.bit_offset + f.size;
+      if (end > bit_in[f.report_id])
+        bit_in[f.report_id] = end;
     }
   }
-
   for (const auto &kv : bit_in) {
     input_reports_.push_back(kv.first);
     input_bits_[kv.first] = kv.second;
@@ -426,40 +527,53 @@ int EatonHidpdProtocol::collection_index(const Field &f, uint16_t page, uint16_t
   return -1;
 }
 
-bool EatonHidpdProtocol::eaton_offset_candidate(const Field &f) const {
-  if (f.size != 8 && f.size != 16 && f.size != 32)
-    return false;
-  const uint16_t vid = parent_ ? parent_->get_vendor_id() : 0;
-  if (vid != 0x0463 && vid != 0x06DA)
-    return false;
-  if (f.log_min != 0)
-    return false;  // already declared signed by the descriptor
-  const uint32_t umax = (f.size >= 32) ? 0xFFFFFFFFu : ((1u << f.size) - 1u);
-  // A "0 .. full-unsigned-range" measurement is Eaton's offset-binary encoding
-  // (0x8000 == 0), exactly what NUT's eaton subdriver compensates for. Some
-  // firmware describes that range with a narrow item (LogMax 0xFF in one byte),
-  // so also accept a full item-width maximum.
-  if (f.log_max_raw == umax)
-    return true;
-  return f.log_max_bits != 0 && f.log_max_bits != f.size &&
-         f.log_max_raw == ((1u << f.log_max_bits) - 1u);
+// NUT libhid.c GetValue(): mask the raw bits to the logical range and
+// sign-extend per the HID spec rule (unsigned iff LogMin and LogMax are both
+// positive), then clamp into [LogMin..LogMax].
+int32_t EatonHidpdProtocol::raw_value(const Field &f, uint32_t raw) const {
+  const uint32_t mag_max = f.log_max >= 0 ? static_cast<uint32_t>(f.log_max)
+                                          : static_cast<uint32_t>(-(f.log_max + 1));
+  const uint32_t mag_min = f.log_min >= 0 ? static_cast<uint32_t>(f.log_min)
+                                          : static_cast<uint32_t>(-(f.log_min + 1));
+  uint32_t hi = mag_max > mag_min ? mag_max : mag_min;
+  uint32_t hibit = 0;
+  while (hi >>= 1)
+    hibit++;
+  const uint32_t signbit = 1u << hibit;
+  const uint32_t mask = (signbit - 1) | ((f.log_min < 0) ? signbit : 0);
+  int32_t v = static_cast<int32_t>(raw & mask);
+  if (f.log_min < 0 && (static_cast<uint32_t>(v) & signbit) != 0)
+    v |= ~static_cast<int32_t>(mask);
+  if (v < f.log_min)
+    v = f.log_min;
+  else if (v > f.log_max)
+    v = f.log_max;
+  return v;
 }
 
-float EatonHidpdProtocol::scaled_value(const Field &f, uint32_t raw, bool measurement) const {
-  int64_t v;
-  if (f.log_min < 0) {
-    v = sign_extend(raw, static_cast<uint8_t>(f.size));
-  } else if (measurement && eaton_offset_candidate(f)) {
-    v = static_cast<int64_t>(raw) - (1LL << (f.size - 1));
-    ESP_LOGV(EATON_TAG, "  offset-binary: raw 0x%04X -> %lld", raw, static_cast<long long>(v));
-  } else {
-    v = static_cast<int64_t>(raw);
+// NUT libhid.c HIDGetDataValue(): logical -> physical (when the descriptor
+// declares Physical Min/Max), then x 10^(UnitExp - HIDUnits[Unit].Expo).
+// Verified against the 5PX Gen2: Voltage items carry unit 0x00F0D121 with
+// UnitExp 6 -> 10^(6-7) = /10 (raw 2291 -> 229.1 V); Frequency carries unit
+// Hertz 0x0000F001 with UnitExp 0x0F, a NUT-signed nibble for -1 -> /10
+// (raw 500 -> 50.0 Hz). NUT applies no other Eaton "bias"; an offset-binary
+// guess applied here in v10 produced the -3047.7 V nonsense.
+float EatonHidpdProtocol::scaled_value(const Field &f, uint32_t raw) const {
+  const int32_t v = raw_value(f, raw);
+  double out = static_cast<double>(v);
+  if (f.have_phy_min && f.have_phy_max && !(f.phy_max == 0 && f.phy_min == 0) && f.phy_max > f.phy_min &&
+      f.log_max > f.log_min) {
+    const double factor = static_cast<double>(f.phy_max - f.phy_min) / static_cast<double>(f.log_max - f.log_min);
+    out = static_cast<double>(v - f.log_min) * factor + f.phy_min;
+    if (out > f.phy_max)
+      out = f.phy_max;
+    if (out < f.phy_min)
+      out = f.phy_min;
   }
-  float out = static_cast<float>(v);
   const int expo = unit_scale_expo(f.unit, f.unit_exp);
   if (expo != 0)
-    out *= powf(10.0f, static_cast<float>(expo));
-  return out;
+    out *= pow(10.0, static_cast<double>(expo));
+  return static_cast<float>(out);
 }
 
 void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const {
@@ -476,8 +590,15 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
   // PowerSummary collection rather than Battery/Input/Output collections.
   const bool summary_ctx = in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_POWER_SUMMARY);
 
-  // --- status bits: 1-bit fields ------------------------------------------
-  if (f.size == 1) {
+  // --- status fields --------------------------------------------------------
+  // One-bit flags, plus Eaton's 8-bit PresentStatus bytes: NUT's mge xfile
+  // reads paths like "UPS.PowerConverter.Input.[1].PresentStatus.Used" as
+  // size-8 fields, so anything living under a PresentStatus / ChangedStatus
+  // collection is boolean (set == raw != 0), regardless of its bit width.
+  const bool status_ctx =
+      f.size == 1 || in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_PRESENT_STATUS) ||
+      in_path(f, HID_USAGE_PAGE_POWER_DEVICE, HID_USAGE_POW_CHANGED_STATUS);
+  if (status_ctx) {
     const bool set = (raw != 0);
     d.has_status = true;
     if (battery_page) {
@@ -554,10 +675,7 @@ void EatonHidpdProtocol::collect(const Field &f, uint32_t raw, Decoded &d) const
   }
 
   // --- numeric fields -----------------------------------------------------
-  const bool measurement = power_page && (f.usage == HID_USAGE_POW_VOLTAGE || f.usage == HID_USAGE_POW_FREQUENCY ||
-                                          f.usage == HID_USAGE_POW_CURRENT || f.usage == HID_USAGE_POW_ACTIVE_POWER ||
-                                          f.usage == HID_USAGE_POW_APPARENT_POWER);
-  const float v = scaled_value(f, raw, measurement);
+  const float v = scaled_value(f, raw);
 
   if (power_page) {
     switch (f.usage) {
@@ -912,7 +1030,7 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
         decoded_any = true;
       if (f.usage != 0 && f.size > 1) {
         ESP_LOGV(EATON_TAG, "  page 0x%02X usage 0x%02X raw 0x%04X -> %.2f", f.page, f.usage, raw,
-                 scaled_value(f, raw, false));
+                 scaled_value(f, raw));
       }
     }
   }
@@ -943,7 +1061,7 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
         decoded_any = true;
       if (f.usage != 0 && f.size > 1) {
         ESP_LOGV(EATON_TAG, "  F page 0x%02X usage 0x%02X raw 0x%04X -> %.2f", f.page, f.usage, raw,
-                 scaled_value(f, raw, false));
+                 scaled_value(f, raw));
       }
     }
   }

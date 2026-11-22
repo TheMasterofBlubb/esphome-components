@@ -37,6 +37,7 @@
 // Device Identification
 #define HID_USAGE_POW_I_NAME                    0x0001
 #define HID_USAGE_POW_PRESENT_STATUS            0x0002
+#define HID_USAGE_POW_CHANGED_STATUS            0x0003
 #define HID_USAGE_POW_UPS                       0x0004
 #define HID_USAGE_POW_POWER_SUPPLY              0x0005
 

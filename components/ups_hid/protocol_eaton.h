@@ -23,11 +23,21 @@ namespace ups_hid {
  *
  *  1. reads the HID report descriptor (GET_DESCRIPTOR, type 0x22),
  *  2. builds a map of "usage + collection path -> report ID / bit offset /
- *     size / logical range / Unit / Unit Exponent",
- *  3. reads each input report and decodes every field by usage, scaling with
- *     the descriptor's Unit Exponent,
- *  4. applies Eaton's offset-binary encoding (0x8000 == 0 for 16-bit) for
- *     Eaton VIDs, matching NUT's HID_ITEM_FLAG_EATON_OFFSET.
+ *     size / logical range / physical range / Unit / Unit Exponent" using a
+ *     direct port of NUT's hidparser (drivers/hidparser.c) - including its
+ *     quirks: per-count continuation items, the usage queue that ignores
+ *     Usage Min/Max (which is what discards the garbage 0xFE/0xFF array
+ *     reports Eaton appends), 4-bit signed Unit Exponent items and the
+ *     LogMax-encoded-as-negative firmware bug workaround,
+ *  3. reads input AND feature reports and decodes every field by usage,
+ *     scaling exactly like NUT's libhid HIDGetDataValue(): logical range
+ *     (mask/sign-extend/clamp) -> physical range -> 10^(UnitExp - UnitTable).
+ *
+ * NUT's value scaling is deliberately used as-is: this device's descriptor
+ * declares exponents that look wrong (6/7/-1 for voltages) but combine with
+ * NUT's HIDUnits base-exponent table to produce exactly the values a real
+ * NUT usbhid-ups run reports (input 229.1 V from raw 2291, 50.0 Hz from
+ * raw 500, ...). Any local reinterpretation so far produced garbage.
  *
  * Everything it decodes is logged, so a VERBOSE log dump of a device shows the
  * full field map plus raw report bytes.
@@ -66,12 +76,15 @@ class EatonHidpdProtocol : public UpsProtocolBase {
                              // reports, exactly what NUT libhid reads via
                              // ITEM_FEATURE); otherwise an INPUT item.
     int32_t log_min{0};      // Logical Minimum, signed interpretation
-    int32_t log_max{0};      // Logical Maximum, signed interpretation
-    uint32_t log_max_raw{0};  // Logical Maximum as read from the descriptor
-    uint8_t log_max_bits{0};  // item size the Logical Maximum was encoded in
+    int32_t log_max{0};      // Logical Maximum (NUT's negative-LogMax hack applied)
+    bool assumed_logmax{false};  // LogMax was reinterpreted from a negative encoding
+    int32_t phy_min{0};      // Physical Minimum / Maximum (rare; NUT applies them)
+    int32_t phy_max{0};
+    bool have_phy_min{false}, have_phy_max{false};
     int32_t unit{0};
-    int32_t unit_exp{0};  // Unit Exponent (log10 multiplier), signed
-    std::vector<PathSeg> path;
+    int32_t unit_exp{0};  // Unit Exponent, NUT-normalised (values >7 are 4-bit signed)
+    std::vector<PathSeg> path;  // collection path only; the field's own usage node
+                                // lives in page/usage (NUT appends it to the path)
   };
 
   // Values decoded from one polling cycle before they are mapped onto UpsData.
@@ -100,8 +113,8 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   bool in_path(const Field &f, uint16_t page, uint16_t usage) const;
   int collection_index(const Field &f, uint16_t page, uint16_t usage) const;
   bool in_battery_collection(const Field &f) const;
-  bool eaton_offset_candidate(const Field &f) const;
-  float scaled_value(const Field &f, uint32_t raw, bool measurement) const;
+  int32_t raw_value(const Field &f, uint32_t raw) const;  // NUT GetValue(): mask/sign/clamp
+  float scaled_value(const Field &f, uint32_t raw) const;
   void collect(const Field &f, uint32_t raw, Decoded &d) const;
   void publish(const Decoded &d, UpsData &data) const;
 
