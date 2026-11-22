@@ -379,7 +379,9 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
           for (size_t k = 0; k < st.path_size; k++)
             f.path.push_back({static_cast<uint16_t>(st.nodes[k] >> 16), static_cast<uint16_t>(st.nodes[k] & 0xFFFF)});
 
-          st.path_size--;  // NUT: remove the usage node (it became page/usage above)
+          // NUT pushes the usage node onto Path for the emitted HIDData_t and
+          // pops it again right after; our Field stores page/usage separately
+          // and f.path holds the collections only, so the stack is untouched.
           unstack_usage();
           if (--st.count == 0)
             reset_local();
