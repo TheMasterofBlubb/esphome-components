@@ -445,11 +445,15 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
   };
 
   // NUT Parse_ReportDesc() driver loop: continuation items (found == 0) are
-  // discarded (their offset book-keeping already advanced via the persistent
+  // discarded (their offset book-keeping already advance via the persistent
   // offsets map); OUTPUT items are parsed for offset book-keeping but never
-  // decoded; and vendor-page (0xFF) usages are dropped outright - they
-  // produced the 0xFE/0xFF report flood in the v10 FIELD MAP and made the
-  // GET_REPORT sweep miss the useful feature reports (cycle budget).
+  // decoded; and vendor-page usages are dropped outright. NUT keeps them in
+  // its item tree but never reads them either - its mge xfile only queries
+  // Power-Device/Battery-page paths. The 5PX declares those vendor arrays
+  // under BOTH page 0x00FF (1-byte Usage Page items) and page 0xFFFF
+  // (4-byte ones); keeping the latter bloats the FEATURE sweep to 114
+  // reports and starves the useful ones (output.voltage in report 0x42
+  // showed up only after several cycles).
   while (fields_.size() < kNutMaxItems) {
     Field f;
     const int ret = parse_one(f);
@@ -457,7 +461,7 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
       break;
     if (ret == 0)
       continue;
-    if (f.page == 0x00FF)
+    if (f.page == 0x00FF || f.page == 0xFFFF)
       continue;
     fields_.push_back(f);
   }
