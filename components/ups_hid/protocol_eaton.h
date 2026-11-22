@@ -61,6 +61,10 @@ class EatonHidpdProtocol : public UpsProtocolBase {
     uint16_t size{0};        // bits
     uint16_t page{0};        // usage page
     uint16_t usage{0};       // usage ID, 0 = constant/padding
+    bool is_feature{false};  // FEATURE item (Eaton 5PX keeps its
+                             // measurements — voltages, status — in feature
+                             // reports, exactly what NUT libhid reads via
+                             // ITEM_FEATURE); otherwise an INPUT item.
     int32_t log_min{0};      // Logical Minimum, signed interpretation
     int32_t log_max{0};      // Logical Maximum, signed interpretation
     uint32_t log_max_raw{0};  // Logical Maximum as read from the descriptor
@@ -108,6 +112,8 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   std::vector<Field> fields_;
   std::vector<uint8_t> input_reports_;
   std::map<uint8_t, uint32_t> input_bits_;  // report ID -> payload bits described
+  std::vector<uint8_t> feature_reports_;
+  std::map<uint8_t, uint32_t> feature_bits_;
   uint32_t descriptor_bytes_{0};
 
   // Cached USB string descriptors (read once in initialize()).
@@ -130,8 +136,11 @@ class EatonHidpdProtocol : public UpsProtocolBase {
   // Latest bytes per report ID, fed by BOTH the interrupt endpoint (NUT
   // style, spontaneous) and GET_REPORT (control poll).
   std::map<uint8_t, std::vector<uint8_t>> report_cache_;
+  std::map<uint8_t, std::vector<uint8_t>> feature_cache_;
   std::map<uint8_t, int> report_strikes_;
+  std::map<uint8_t, int> feature_strikes_;
   std::set<uint8_t> dead_reports_;        // GET_REPORT refuses/hangs on these
+  std::set<uint8_t> dead_features_;
   std::set<uint8_t> interrupt_seen_;      // report IDs already announced
   bool interrupt_unsupported_{false};     // transport has no interrupt EP
   size_t map_lines_logged_{0};            // FIELD MAP stream cap accounting

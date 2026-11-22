@@ -126,6 +126,10 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   map_lines_logged_ = 0;
   report_strikes_.clear();
   dead_reports_.clear();
+  feature_strikes_.clear();
+  dead_features_.clear();
+  report_cache_.clear();
+  feature_cache_.clear();
   if (!parse_descriptor(rd)) {
     last_error_ = "descriptor read OK (" + std::to_string(descriptor_bytes_) +
                   " bytes) but field map unusable: " + std::to_string(fields_.size()) + " fields found";
@@ -142,11 +146,17 @@ bool EatonHidpdProtocol::fetch_and_parse() {
   pending_logs_.clear();
   char line[240];
   int used = snprintf(line, sizeof(line),
-                      "Eaton HID-PDC map: %zu fields across %zu input reports (descriptor %u bytes) bits:",
-                      fields_.size(), input_reports_.size(), static_cast<unsigned>(descriptor_bytes_));
+                      "Eaton HID-PDC map: %zu fields, %zu input + %zu feature reports (descriptor %u bytes) bits:",
+                      fields_.size(), input_reports_.size(), feature_reports_.size(),
+                      static_cast<unsigned>(descriptor_bytes_));
   for (const uint8_t rid : input_reports_) {
     if (used > 0 && used < static_cast<int>(sizeof(line)) - 14)
       used += snprintf(line + used, sizeof(line) - used, " %02X/%u", rid, static_cast<unsigned>(input_bits_[rid]));
+  }
+  for (const uint8_t rid : feature_reports_) {
+    if (used > 0 && used < static_cast<int>(sizeof(line)) - 15)
+      used += snprintf(line + used, sizeof(line) - used, " f%02X/%u", rid,
+                       static_cast<unsigned>(feature_bits_[rid]));
   }
   pending_logs_.emplace_back(line);
   ESP_LOGI(EATON_TAG, "%s", line);
@@ -199,6 +209,8 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
   fields_.clear();
   input_reports_.clear();
   input_bits_.clear();
+  feature_reports_.clear();
+  feature_bits_.clear();
 
   uint16_t report_size = 0;
   uint16_t report_count = 0;
@@ -328,7 +340,7 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
             // HID: if Report Count exceeds the usage list, the last usage repeats
             u = local_usages[c < local_usages.size() ? c : local_usages.size() - 1];
           }
-          if (tag == 0x80 && fields_.size() < 1500) {
+          if (fields_.size() < 1500) {
             // Hard cap: a malformed/vendored descriptor with huge Report
             // Counts must not exhaust the heap.
             Field f;
@@ -339,6 +351,7 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
             // An array of constants carries no usage; fields with usage 0 are
             // still needed so the bit offsets of the following fields line up.
             f.usage = u;
+            f.is_feature = (tag != 0x80);
             f.log_min = log_min;
             f.log_max = log_max;
             f.log_max_raw = log_max_raw;
@@ -363,6 +376,10 @@ bool EatonHidpdProtocol::parse_descriptor(const std::vector<uint8_t> &rd) {
   for (const auto &kv : bit_in) {
     input_reports_.push_back(kv.first);
     input_bits_[kv.first] = kv.second;
+  }
+  for (const auto &kv : bit_feat) {
+    feature_reports_.push_back(kv.first);
+    feature_bits_[kv.first] = kv.second;
   }
 
   // Require a handful of recognisable HID-PDC usages before claiming the device.
@@ -830,6 +847,44 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
     report_cache_[report_id].assign(body, body + body_len);
   }
 
+  // FEATURE report sweep: the Eaton 5PX keeps its real measurements
+  // (voltages, status, runtime) in FEATURE items; NUT libhid reads exactly
+  // these via FindObject_with_Path(..., ITEM_FEATURE) + GET_REPORT(FEATURE).
+  for (uint8_t report_id : feature_reports_) {
+    if (dead_features_.find(report_id) != dead_features_.end())
+      continue;
+    const uint32_t left = budget_left();
+    if (left < 400) {
+      ESP_LOGD(EATON_TAG, "feature sweep stopped at cycle budget; rest deferred");
+      break;
+    }
+    uint8_t buf[MAX_REPORT_BYTES];
+    size_t len = sizeof(buf);
+    const esp_err_t err =
+        parent_->hid_get_report(HID_REPORT_TYPE_FEATURE, report_id, buf, &len, std::min<uint32_t>(700, left));
+    if (err != ESP_OK || len == 0) {
+      if (++feature_strikes_[report_id] >= 2) {
+        dead_features_.insert(report_id);
+        ESP_LOGW(EATON_TAG, "GET_REPORT feature 0x%02X failed twice; disabled", report_id);
+      } else {
+        ESP_LOGD(EATON_TAG, "GET_REPORT feature 0x%02X failed: %s", report_id, esp_err_to_name(err));
+      }
+      continue;
+    }
+    if (poll_cycles_ >= 2 && poll_cycles_ <= 4)
+      ESP_LOGD(EATON_TAG, "feature report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
+    else
+      ESP_LOGV(EATON_TAG, "feature report 0x%02X [%zu bytes]: %s", report_id, len, hex_dump(buf, len).c_str());
+
+    const uint8_t *body = buf;
+    size_t body_len = len;
+    if (report_id != 0 && body_len > 1 && body[0] == report_id) {
+      body++;
+      body_len--;  // control-transfer GET_REPORT echoes the report ID
+    }
+    feature_cache_[report_id].assign(body, body + body_len);
+  }
+
   // Decode from the cache: every report ID uses its freshest bytes, no
   // matter which source (interrupt or GET_REPORT) delivered them.
   for (uint8_t report_id : input_reports_) {
@@ -847,7 +902,7 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
     }
 
     for (const auto &f : fields_) {
-      if (f.report_id != report_id)
+      if (f.report_id != report_id || f.is_feature)
         continue;
       if (f.bit_offset + f.size > body_len * 8)
         continue;  // beyond what the device actually sent
@@ -857,6 +912,37 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
         decoded_any = true;
       if (f.usage != 0 && f.size > 1) {
         ESP_LOGV(EATON_TAG, "  page 0x%02X usage 0x%02X raw 0x%04X -> %.2f", f.page, f.usage, raw,
+                 scaled_value(f, raw, false));
+      }
+    }
+  }
+
+  // Decode the feature reports (same path-based collect()).
+  for (uint8_t report_id : feature_reports_) {
+    auto it = feature_cache_.find(report_id);
+    if (it == feature_cache_.end())
+      continue;
+    const std::vector<uint8_t> &cbuf = it->second;
+    const uint8_t *body = cbuf.data();
+    const size_t body_len = cbuf.size();
+
+    const uint32_t described_bits = feature_bits_[report_id];
+    if (described_bits > body_len * 8 && poll_cycles_ <= 6) {
+      ESP_LOGW(EATON_TAG, "feature report 0x%02X is %zu bytes but the descriptor describes %u bits", report_id,
+               body_len, static_cast<unsigned>(described_bits));
+    }
+
+    for (const auto &f : fields_) {
+      if (f.report_id != report_id || !f.is_feature)
+        continue;
+      if (f.bit_offset + f.size > body_len * 8)
+        continue;
+      const uint32_t raw = extract_bits(body, body_len, f.bit_offset, f.size);
+      collect(f, raw, d);
+      if (f.usage != 0)
+        decoded_any = true;
+      if (f.usage != 0 && f.size > 1) {
+        ESP_LOGV(EATON_TAG, "  F page 0x%02X usage 0x%02X raw 0x%04X -> %.2f", f.page, f.usage, raw,
                  scaled_value(f, raw, false));
       }
     }
@@ -878,8 +964,9 @@ bool EatonHidpdProtocol::read_data(UpsData &data) {
       const Field &f = fields_[map_dump_pos_];
       if (f.usage == 0)
         continue;
-      ESP_LOGD(EATON_TAG, "  rpt 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
-               f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage, static_cast<int>(f.log_min),
+      ESP_LOGD(EATON_TAG, "  %s 0x%02X bit %2u size %2u  page 0x%02X usage 0x%02X  log %d..%d  unit 0x%04X exp %d  %s",
+               f.is_feature ? "FET" : "IN", f.report_id, static_cast<unsigned>(f.bit_offset), f.size, f.page, f.usage,
+               static_cast<int>(f.log_min),
                static_cast<int>(f.log_max), static_cast<unsigned>(f.unit), static_cast<int>(f.unit_exp),
                path_to_string(f.path).c_str());
       if (++map_lines_logged_ >= 140) {
