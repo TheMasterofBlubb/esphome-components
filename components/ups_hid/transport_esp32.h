@@ -52,6 +52,10 @@ public:
 
     std::string get_usb_topology_summary() const override { return usb_topology_summary_; }
 
+    bool descriptor_fetch_pending() const override {
+        return desc_state_.load(std::memory_order_acquire) == DESC_RUNNING;
+    }
+
     esp_err_t read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) override;
 
 private:
@@ -88,9 +92,19 @@ private:
     // HID class descriptor lengths, kept report-descriptor index.
     std::string usb_topology_summary_;
 
-    // Cooldown (esp_timer us) after a full-size report-descriptor read timed
-    // out: fetch small windows until then to protect the loop task.
-    int64_t small_window_until_us_{0};
+    // Asynchronous report-descriptor fetch: the Eaton 5PX Gen2 needs a 23 KB
+    // GET_DESCRIPTOR that can take longer than the 5 s task watchdog allows
+    // on the loop task, so the whole fetch runs on a dedicated FreeRTOS task.
+    enum DescState : uint8_t { DESC_IDLE = 0, DESC_RUNNING = 1, DESC_DONE = 2, DESC_FAILED = 3 };
+    std::atomic<uint8_t> desc_state_{DESC_IDLE};
+    std::vector<uint8_t> desc_cache_;
+    std::mutex desc_mutex_;
+    int desc_attempts_{0};
+    int64_t desc_retry_after_us_{0};
+    static constexpr int DESC_MAX_ATTEMPTS = 4;
+
+    static void desc_fetch_task(void* arg);
+    esp_err_t do_descriptor_fetch(std::vector<uint8_t>& descriptor, uint32_t timeout_ms);
     
     // Private methods
     static void usb_lib_task(void* arg);

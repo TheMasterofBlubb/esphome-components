@@ -67,6 +67,15 @@ esp_err_t Esp32UsbTransport::deinitialize() {
     
     connected_ = false;
     initialized_ = false;
+
+    // Drop any async descriptor state with the device.
+    desc_state_.store(DESC_IDLE, std::memory_order_release);
+    desc_attempts_ = 0;
+    desc_retry_after_us_ = 0;
+    {
+        std::lock_guard<std::mutex> dlock(desc_mutex_);
+        std::vector<uint8_t>().swap(desc_cache_);
+    }
     
     esp_err_t ret = teardown_usb_host();
     if (ret != ESP_OK) {
@@ -440,8 +449,7 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
     return ret;
 }
 
-esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descriptor,
-                                                   uint32_t timeout_ms) {
+esp_err_t Esp32UsbTransport::do_descriptor_fetch(std::vector<uint8_t>& descriptor, uint32_t timeout_ms) {
     if (!device_.dev_hdl) {
         set_last_error("USB device not ready");
         return ESP_ERR_INVALID_STATE;
@@ -616,20 +624,16 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     // ~23 KB report descriptor (its full measurement MIB), and a truncated
     // fetch yields a useless partial map. A huge 23 KB DMA alloc could fail on
     // a loaded ESP32, so fall back to the old 2 KB window in that case.
+    // This function runs on its OWN task (desc_fetch_task), so waits can be
+    // generous (8 s per big transfer) without endangering the task watchdog.
+    // A truncated fetch of a big descriptor is useless: request the full
+    // declared length; fall back to 2 KB only if the DMA alloc fails.
     uint16_t want = report_desc_len;
     if (want < 1024)
       want = 1024;
     if (want > 32768)
       want = 32768;
-    // Transfer timeout scaled with size but kept WELL under the 5 s task
-    // watchdog: the loop task blocks here. 23 KB streams in ~0.5 s on a
-    // healthy EP0; a device that NAK-throttles gets ~2.5 s, after which we
-    // give up (leak-safe) and retry later with the smaller window.
-    // A recent full-size timeout arms a cooldown: fetch at 2048 for a while
-    // instead of stalling the loop with slow full-size attempts every cycle.
-    if (report_desc_len > 2048 && esp_timer_get_time() < small_window_until_us_)
-      want = 2048;
-    const uint32_t desc_to = timeout_ms + std::min<uint32_t>(1500, want / 16);
+    const uint32_t desc_to = timeout_ms;
     std::vector<uint8_t> best;
     uint8_t best_idx = 0;
     for (uint8_t idx = 0; idx <= 1; idx++) {
@@ -654,14 +658,12 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
                 best_idx = idx;
             }
         } else if (idx == 0) {
-            if (r == ESP_ERR_TIMEOUT && want > 2048) {
-                small_window_until_us_ = esp_timer_get_time() + 60 * 1000000LL;
-                ESP_LOGW(ESP32_USB_TAG,
-                         "Full %u-byte report descriptor read timed out; using 2048-byte window for 60 s",
-                         static_cast<unsigned>(want));
-            } else {
-                ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR index 0 failed: %s", esp_err_to_name(r));
+            if (r == ESP_ERR_TIMEOUT) {
+                ESP_LOGW(ESP32_USB_TAG, "Full %u-byte report descriptor read timed out after %u ms",
+                         static_cast<unsigned>(want), static_cast<unsigned>(desc_to));
+                break;  // index 1 will not answer either; retry whole fetch later
             }
+            ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT_DESCRIPTOR index 0 failed: %s", esp_err_to_name(r));
         }
     }
 
@@ -758,6 +760,67 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descrip
     ESP_LOGI(ESP32_USB_TAG, "HID report descriptor: %zu bytes (index %u, wDescriptorLength=%u)",
              descriptor.size(), static_cast<unsigned>(best_idx), static_cast<unsigned>(report_desc_len));
     return ESP_OK;
+}
+
+// ---- asynchronous descriptor fetch (dedicated task, watchdog-free) -------
+
+esp_err_t Esp32UsbTransport::get_report_descriptor(std::vector<uint8_t>& descriptor,
+                                                   uint32_t /*timeout_ms*/) {
+    if (!device_.dev_hdl) {
+        set_last_error("USB device not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t st = desc_state_.load(std::memory_order_acquire);
+    if (st == DESC_DONE) {
+        std::lock_guard<std::mutex> lock(desc_mutex_);
+        if (!desc_cache_.empty()) {
+            descriptor = desc_cache_;  // copy: parser wants a local buffer
+            return ESP_OK;
+        }
+        st = DESC_IDLE;
+    }
+    if (st == DESC_RUNNING)
+        return ESP_ERR_INVALID_STATE;  // fetch task in flight
+    if (st == DESC_FAILED) {
+        if (desc_attempts_ >= DESC_MAX_ATTEMPTS)
+            return ESP_FAIL;  // permanently give up until re-enumeration
+        if (esp_timer_get_time() < desc_retry_after_us_)
+            return ESP_ERR_INVALID_STATE;  // backoff window
+    }
+
+    uint8_t expected = st;
+    if (!desc_state_.compare_exchange_strong(expected, DESC_RUNNING, std::memory_order_acq_rel))
+        return ESP_ERR_INVALID_STATE;
+    desc_attempts_++;
+    if (desc_attempts_ == 1)
+        ESP_LOGI(ESP32_USB_TAG, "Fetching HID report descriptor on a dedicated task (slow devices OK)");
+    if (xTaskCreate(desc_fetch_task, "ups_hid_desc", 6144, this, 5, nullptr) != pdPASS) {
+        desc_state_.store(DESC_FAILED, std::memory_order_release);
+        desc_retry_after_us_ = esp_timer_get_time() + 30 * 1000000LL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_ERR_INVALID_STATE;
+}
+
+void Esp32UsbTransport::desc_fetch_task(void* arg) {
+    auto* self = static_cast<Esp32UsbTransport*>(arg);
+    std::vector<uint8_t> rd;
+    const esp_err_t err = self->do_descriptor_fetch(rd, 8000);
+    if (err == ESP_OK && rd.size() >= 8) {
+        ESP_LOGI(ESP32_USB_TAG, "Async report descriptor ready: %zu bytes", rd.size());
+        {
+            std::lock_guard<std::mutex> lock(self->desc_mutex_);
+            self->desc_cache_.swap(rd);
+        }
+        self->desc_state_.store(DESC_DONE, std::memory_order_release);
+    } else {
+        self->desc_state_.store(DESC_FAILED, std::memory_order_release);
+        self->desc_retry_after_us_ = esp_timer_get_time() + 30 * 1000000LL;
+        ESP_LOGW(ESP32_USB_TAG, "Async report descriptor fetch failed (%s), attempt %d of %d",
+                 esp_err_to_name(err), self->desc_attempts_, DESC_MAX_ATTEMPTS);
+    }
+    vTaskDelete(nullptr);
 }
 
 std::string Esp32UsbTransport::get_last_error() const {

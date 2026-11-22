@@ -156,13 +156,18 @@ void UpsHidComponent::update() {
     // Check for timer updates (fast polling during countdowns)
     check_and_update_timers();
   } else {
-    consecutive_failures_++;
-    ESP_LOGW(TAG, log_messages::READ_FAILED, (unsigned) consecutive_failures_);
-    
-    if (consecutive_failures_ > max_consecutive_failures_) {
-      ESP_LOGW(TAG, log_messages::RESETTING_PROTOCOL);
-      active_protocol_.reset();  // Force protocol re-detection on next update
-      consecutive_failures_ = 0;
+    if (descriptor_fetch_pending()) {
+      // Async report-descriptor fetch in flight: not a read failure.
+      ESP_LOGD(TAG, "USB data pending (report descriptor fetch in flight)");
+    } else {
+      consecutive_failures_++;
+      ESP_LOGW(TAG, log_messages::READ_FAILED, (unsigned) consecutive_failures_);
+      
+      if (consecutive_failures_ > max_consecutive_failures_) {
+        ESP_LOGW(TAG, log_messages::RESETTING_PROTOCOL);
+        active_protocol_.reset();  // Force protocol re-detection on next update
+        consecutive_failures_ = 0;
+      }
     }
   }
 }
@@ -238,6 +243,10 @@ esp_err_t UpsHidComponent::get_report_descriptor(std::vector<uint8_t>& descripto
 
 std::string UpsHidComponent::usb_topology_summary() const {
   return transport_ ? transport_->get_usb_topology_summary() : std::string();
+}
+
+bool UpsHidComponent::descriptor_fetch_pending() const {
+  return transport_ && transport_->descriptor_fetch_pending();
 }
 
 esp_err_t UpsHidComponent::read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) {

@@ -239,6 +239,9 @@ namespace esphome
       // One-line USB topology summary (diagnostics; empty when unavailable)
       std::string usb_topology_summary() const;
 
+      // True while the transport's async descriptor fetch task is in flight
+      bool descriptor_fetch_pending() const;
+
       // Interrupt-IN poll (spontaneous device reports; NOT_SUPPORTED if the
       // transport has no interrupt endpoint)
       esp_err_t read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms);

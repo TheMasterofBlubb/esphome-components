@@ -98,6 +98,11 @@ bool EatonHidpdProtocol::initialize() {
 bool EatonHidpdProtocol::fetch_and_parse() {
   std::vector<uint8_t> rd;
   const esp_err_t err = parent_->get_report_descriptor(rd);
+  if (err == ESP_ERR_INVALID_STATE && parent_->descriptor_fetch_pending()) {
+    // Fetch runs on a dedicated USB task; data path stays idle meanwhile.
+    ESP_LOGD(EATON_TAG, "report descriptor fetch in flight on USB task; retry next cycle");
+    return false;
+  }
   if (err != ESP_OK || rd.size() < 8) {
     last_error_ = std::string("GET_DESCRIPTOR(0x22) failed: ") + esp_err_to_name(err) +
                   " (" + std::to_string(rd.size()) + " bytes read)";

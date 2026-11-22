@@ -57,6 +57,10 @@ public:
     // the transport has none.
     virtual std::string get_usb_topology_summary() const { return std::string(); }
 
+    // True while an asynchronous report-descriptor fetch is in flight
+    // (get_report_descriptor returns ESP_ERR_INVALID_STATE meanwhile).
+    virtual bool descriptor_fetch_pending() const { return false; }
+
     // Non-blocking-ish interrupt-IN poll. Transports without an interrupt
     // endpoint (or without support for this call) return NOT_SUPPORTED.
     virtual esp_err_t read_interrupt(uint8_t* data, size_t* len, uint32_t timeout_ms) {
