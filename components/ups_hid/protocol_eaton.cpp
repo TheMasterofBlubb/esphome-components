@@ -84,12 +84,19 @@ bool EatonHidpdProtocol::detect() {
   if (!parent_->is_connected()) {
     return false;
   }
-  return fetch_and_parse();
+  if (fetch_and_parse())
+    return true;
+  // Async engine: the fetch task is in flight, the map is parsed on the
+  // first poll cycle once it lands. Optimistically accept (this protocol
+  // was selected for an Eaton device); read_data re-checks each cycle.
+  return parent_->descriptor_fetch_pending();
 }
 
 bool EatonHidpdProtocol::initialize() {
   if (fields_.empty() && !fetch_and_parse()) {
-    return false;
+    if (!parent_->descriptor_fetch_pending())
+      return false;
+    ESP_LOGI(EATON_TAG, "report descriptor fetch running on USB task; parsing on first poll");
   }
   read_strings();
   return true;
